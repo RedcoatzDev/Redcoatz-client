@@ -14,7 +14,7 @@ No imports, on purpose: ntw3ladder.py logs the version before loading
 anything else, so a build that fails early can still be identified.
 """
 
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 
 #: What every outgoing request identifies itself as.
 USER_AGENT = f"ntw3ladder-client/{VERSION}"

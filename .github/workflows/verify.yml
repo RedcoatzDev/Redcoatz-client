@@ -2,12 +2,13 @@
 # attaches it to the release for the tag, and compares it with the exe the
 # website serves.
 #
-# Runs when a release tag is pushed, and on demand from the Actions tab. The
-# toolchain to use comes from https://redcoatz.com/client-version.json, which
+# Runs when a release tag is pushed, and on demand from the Actions tab. What
+# to build with comes from https://redcoatz.com/client-version.json, which
 # build.py writes beside each published exe: the build date (the archive's
-# only timestamp), and the Python, PyInstaller and truststore versions. With
-# those, build.py --verify produces the same bytes, so a matching hash means
-# the exe people download from the website is this source and nothing else.
+# only timestamp) and the Python version. build.py installs its own pinned
+# PyInstaller into a venv, so with that Python, build.py --verify produces
+# the same bytes, and a matching hash means the exe people download from the
+# website is this source and nothing else.
 #
 # The exe attached to the release is the one built here, so a download from
 # GitHub depends on nothing but this source and GitHub's runner. It is
@@ -43,8 +44,6 @@ jobs:
           "SERVED_SHA256=$($m.sha256)"    >> $env:GITHUB_ENV
           "BUILT=$($m.built)"             >> $env:GITHUB_ENV
           "PY=$($m.python)"               >> $env:GITHUB_ENV
-          "PYINSTALLER=$($m.pyinstaller)" >> $env:GITHUB_ENV
-          "TRUSTSTORE=$($m.truststore)"   >> $env:GITHUB_ENV
           "SRC_VERSION=$src"              >> $env:GITHUB_ENV
           "website serves $($m.version) built $($m.built); this source is $src"
 
@@ -52,9 +51,8 @@ jobs:
         with:
           python-version: ${{ env.PY }}
 
-      - name: Install the recorded toolchain
-        run: pip install "pyinstaller==${{ env.PYINSTALLER }}" "truststore==${{ env.TRUSTSTORE }}"
-
+      # build.py makes .venv-build with its pinned PyInstaller and builds
+      # from there; nothing is installed here.
       - name: Rebuild with the recorded build date
         run: python build.py --verify ${{ env.BUILT }}
 

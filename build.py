@@ -8,12 +8,24 @@ Output lands in client/dist/. By default the exe is then copied to
 web/public/Redcoatz.exe and web/public/client-version.json is rewritten with
 its version, size, SHA-256 and build date; --no-publish skips that.
 
-Builds are reproducible. PyInstaller runs with SOURCE_DATE_EPOCH set to
-midnight UTC of the build date and PYTHONHASHSEED=0, which removes the two
-things that made identical source produce different bytes: timestamps written
-into the archive and hash-seeded ordering. Anyone with the same Python and
-PyInstaller versions (both recorded in client-version.json) who checks out the
-release tag and runs build.py --verify <built date> gets the published hash.
+Builds are reproducible across machines. Four things made identical source
+produce different bytes, and each is pinned here:
+
+  * timestamps in the archive: SOURCE_DATE_EPOCH is midnight UTC of the
+    build date, which client-version.json records as "built";
+  * hash-seeded ordering: PYTHONHASHSEED=0;
+  * whatever else is installed beside PyInstaller: the build runs from
+    client/.venv-build, a venv this script makes with exactly PINS in it.
+    On 30 October 2026 the machine's setuptools rode into the exe (2 MB of
+    it) because PyInstaller's hooks saw it installed;
+  * the Universal C Runtime: PyInstaller bundles the api-ms-win-*.dll
+    forwarders and ucrtbase.dll it finds, and those are whatever Windows
+    SDK or Windows build the builder has. They are part of Windows 10 and
+    later, so the spec drops them and the exe uses the system's.
+
+Anyone with the same Python version (recorded in client-version.json) who
+checks out the release tag and runs build.py --verify <built date> gets the
+published hash; .github/workflows/verify.yml does exactly that on GitHub.
 
 What the exe embeds: the Python runtime and the libraries the client imports,
 the client's modules from this folder (ntw3ladder.py and everything it
@@ -31,10 +43,8 @@ machines whose antivirus scans HTTPS.
 
 import argparse
 import datetime
-import importlib.metadata
 import json
 import os
-import platform
 import shutil
 import subprocess
 import re
@@ -49,6 +59,79 @@ from version import VERSION  # noqa: E402
 #: figure's head and shoulders, because two full figures at 16 pixels are
 #: smudges; Windows picks the frame for the size it needs.
 ICON = os.path.join(HERE, "redcoatz.ico")
+
+#: The toolchain that goes into the exe, pinned so two machines build the
+#: same bytes. Installed into VENV by _build_python; nothing else from the
+#: building machine's Python reaches the archive. Bump deliberately, and
+#: the next release records the new versions in client-version.json.
+PYINSTALLER = "6.22.0"
+HOOKS_CONTRIB = "2026.9"
+TRUSTSTORE = "0.10.4"
+PINS = [f"pyinstaller=={PYINSTALLER}",
+        f"pyinstaller-hooks-contrib=={HOOKS_CONTRIB}",
+        f"truststore=={TRUSTSTORE}"]
+VENV = os.path.join(HERE, ".venv-build")
+
+
+def _build_python():
+    """The interpreter PyInstaller runs under: VENV, made from this one with
+    exactly PINS installed. Rebuilt whenever the pins change.
+    """
+    py = os.path.join(VENV, "Scripts", "python.exe")
+    stamp = os.path.join(VENV, "pins.txt")
+    want = " ".join(PINS)
+    have = ""
+    if os.path.exists(stamp):
+        with open(stamp, "r", encoding="utf-8") as f:
+            have = f.read().strip()
+    if have != want or not os.path.exists(py):
+        print(f"  making {VENV}\n    {want}")
+        shutil.rmtree(VENV, ignore_errors=True)
+        subprocess.run([sys.executable, "-m", "venv", VENV], check=True)
+        subprocess.run([py, "-m", "pip", "install", "-q",
+                        "--disable-pip-version-check", *PINS], check=True)
+        with open(stamp, "w", encoding="utf-8") as f:
+            f.write(want + "\n")
+    return py
+
+
+def _toolchain(py):
+    """What the build interpreter actually has, for client-version.json."""
+    out = subprocess.run(
+        [py, "-c",
+         "import platform, PyInstaller, importlib.metadata as m;"
+         "print(platform.python_version(), PyInstaller.__version__,"
+         " m.version('pyinstaller-hooks-contrib'), m.version('truststore'))"],
+        capture_output=True, text=True, check=True).stdout.split()
+    return dict(zip(("python", "pyinstaller", "hooks_contrib", "truststore"), out))
+
+
+#: Dropped from the archive by the spec: see the module docstring.
+UCRT_FILTER = (
+    "# Added by build.py. The Universal C Runtime is part of Windows 10 and\n"
+    "# later, and the copies PyInstaller finds differ from machine to machine,\n"
+    "# so they stay out and the exe uses the system's.\n"
+    "a.binaries = [b for b in a.binaries\n"
+    "              if not (b[0].lower().startswith('api-ms-win-')\n"
+    "                      or b[0].lower() == 'ucrtbase.dll')]\n")
+
+
+def _write_spec(py, opts, script):
+    """build/Redcoatz.spec: PyInstaller's own makespec from the options, then
+    the UCRT filter inserted before the PYZ is built. Generated every time,
+    so the spec never drifts from the options here.
+    """
+    subprocess.run([py, "-m", "PyInstaller.utils.cliutils.makespec",
+                    *opts, script], cwd=HERE, check=True)
+    spec = os.path.join(HERE, "build", "Redcoatz.spec")
+    with open(spec, "r", encoding="utf-8") as f:
+        text = f.read()
+    if "pyz = PYZ(" not in text:
+        raise SystemExit(f"{spec} has no 'pyz = PYZ(' line to anchor the UCRT filter on")
+    text = text.replace("pyz = PYZ(", UCRT_FILTER + "pyz = PYZ(", 1)
+    with open(spec, "w", encoding="utf-8") as f:
+        f.write(text)
+    return spec
 
 
 def _version_file():
@@ -192,11 +275,8 @@ def main():
     global VERSION
     VERSION = _choose_version(args.version, args.force, not args.no_publish)
 
-    try:
-        import PyInstaller  # noqa: F401
-    except ImportError:
-        print("PyInstaller is not installed.  pip install pyinstaller")
-        return 1
+    py = _build_python()
+    tools = _toolchain(py)
 
     # A published build is always built from scratch: PyInstaller once rebuilt
     # only the exe wrapper around a stale cached payload, and the release
@@ -205,9 +285,8 @@ def main():
         for d in ("build", "dist"):
             shutil.rmtree(os.path.join(HERE, d), ignore_errors=True)
 
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
-        "--noconfirm",
+    # What the spec is made from; see _write_spec.
+    opts = [
         "--name", "Redcoatz",
         "--onedir" if args.onedir else "--onefile",
         "--console" if args.console else "--windowed",
@@ -248,10 +327,14 @@ def main():
         "--hidden-import", "singleton",
         "--version-file", _version_file(),
         "--paths", HERE,
+        "--specpath", os.path.join(HERE, "build"),
+    ]
+    spec = _write_spec(py, opts, os.path.join(HERE, "ntw3ladder.py"))
+    cmd = [
+        py, "-m", "PyInstaller", "--noconfirm",
         "--distpath", os.path.join(HERE, "dist"),
         "--workpath", os.path.join(HERE, "build"),
-        "--specpath", os.path.join(HERE, "build"),
-        os.path.join(HERE, "ntw3ladder.py"),
+        spec,
     ]
 
     # Reproducibility: the build date, as midnight UTC, is the only timestamp
@@ -263,8 +346,7 @@ def main():
         built, datetime.time(), datetime.timezone.utc).timestamp())
     env = dict(os.environ, SOURCE_DATE_EPOCH=str(epoch), PYTHONHASHSEED="0")
     print(f"SOURCE_DATE_EPOCH={epoch} ({built})  PYTHONHASHSEED=0  "
-          f"python {platform.python_version()}  "
-          f"pyinstaller {PyInstaller.__version__}")
+          + "  ".join(f"{k} {v}" for k, v in tools.items()))
     print(" ".join(cmd), "\n")
     r = subprocess.run(cmd, cwd=HERE, env=env)
     if r.returncode != 0:
@@ -304,11 +386,9 @@ def main():
                     # The UTC date whose midnight was SOURCE_DATE_EPOCH;
                     # build.py --verify <built> rebuilds this exact exe.
                     "built": built.isoformat(),
-                    # What a verifier must install to get the same bytes.
-                    "python": platform.python_version(),
-                    "pyinstaller": PyInstaller.__version__,
-                    # The one third-party package inside the exe.
-                    "truststore": importlib.metadata.version("truststore"),
+                    # What a verifier needs to get the same bytes: this
+                    # Python, and build.py installs the rest (PINS).
+                    **tools,
                 }, f, indent=2)
             print(f"published -> {meta}")
             print("  commit this, then deploy, or the site serves the old one")
