@@ -1,0 +1,117 @@
+-- Redcoatz post-battle hook.
+--
+-- This replaces the game's own button_rematch script on the multiplayer
+-- post-battle screen. The original is 386 bytes and does one thing: when the
+-- Rematch button is released it calls BattleUI.MPVoteRestart(). That is kept,
+-- unchanged, below.
+--
+-- The addition: when this script is loaded -- which is when the post-battle
+-- screen is built -- it asks the engine for the battle's results through
+-- BattleUI.PostBattleInfo(), the same call the screen itself is drawn from,
+-- and writes them to a file for the Redcoatz client to pick up. The client
+-- used to read this screen back out of the game's memory, which worked about
+-- a third of the time. This is the game's own table, every time.
+--
+-- Everything extra is inside pcall. If anything here fails the screen still
+-- works and the button still works; the only loss is the file.
+--
+-- Written as Lua SOURCE under a .luac name: the engine hands the file's bytes
+-- to Lua, and Lua accepts source or bytecode by looking at the first byte.
+
+function OnLeaveDepress()
+    BattleUI.MPVoteRestart()
+end
+
+local function redcoatz_dump()
+    local seen = {}
+
+    local function esc(s)
+        s = tostring(s)
+        s = string.gsub(s, '\\', '\\\\')
+        s = string.gsub(s, '"', '\\"')
+        s = string.gsub(s, '\n', '\\n')
+        s = string.gsub(s, '\r', '')
+        return '"' .. s .. '"'
+    end
+
+    -- JSON, by hand: this Lua has no json library, and the table is small.
+    -- Anything that is not a string, number, boolean or table is written as
+    -- its type and tostring, so an unexpected shape is visible rather than
+    -- silently dropped.
+    local function ser(v, depth)
+        local t = type(v)
+        if t == "string" then return esc(v) end
+        if t == "number" then return tostring(v) end
+        if t == "boolean" then return v and "true" or "false" end
+        if t == "nil" then return "null" end
+        if t ~= "table" then return esc("<" .. t .. " " .. tostring(v) .. ">") end
+        if seen[v] or depth > 12 then return '"<cycle or too deep>"' end
+        seen[v] = true
+        -- An array if every key is 1..n.
+        local n = 0
+        for _ in pairs(v) do n = n + 1 end
+        local isarr = n > 0
+        for i = 1, n do
+            if v[i] == nil then isarr = false break end
+        end
+        local out = {}
+        if isarr then
+            for i = 1, n do out[#out + 1] = ser(v[i], depth + 1) end
+            seen[v] = nil
+            return "[" .. table.concat(out, ",") .. "]"
+        end
+        for k, val in pairs(v) do
+            out[#out + 1] = esc(k) .. ":" .. ser(val, depth + 1)
+        end
+        seen[v] = nil
+        return "{" .. table.concat(out, ",") .. "}"
+    end
+
+    local dir = os.getenv("APPDATA")
+    if not dir then return "no APPDATA" end
+    dir = dir .. "/ntw3ladder"
+
+    local log = io.open(dir .. "/postbattle.log", "a")
+    local function note(s)
+        if log then log:write(os.date("%Y-%m-%d %H:%M:%S "), s, "\n") end
+    end
+    note("hook loaded")
+
+    local ok, info = pcall(BattleUI.PostBattleInfo)
+    if not ok then
+        note("PostBattleInfo raised: " .. tostring(info))
+        if log then log:close() end
+        return
+    end
+    note("PostBattleInfo returned a " .. type(info))
+
+    local f = io.open(dir .. "/postbattle.json", "w")
+    if not f then
+        note("could not open postbattle.json for writing")
+        if log then log:close() end
+        return
+    end
+    f:write('{"written":', esc(os.date("%Y-%m-%dT%H:%M:%S")),
+            ',"info":', ser(info, 0), "}\n")
+    f:close()
+    note("wrote postbattle.json")
+
+    -- Save the replay, without anybody pressing anything.
+    --
+    -- BattleUI.SaveReplay is the call behind the Save Replay button ("In:
+    -- battle replay file name"). Most battles were never saved because the
+    -- offer comes up for a few seconds at the end and most people click
+    -- past it; the archive can only hold what was saved. A timestamped name
+    -- cannot collide with a manual save, and the uploader deduplicates by
+    -- content, so a battle saved twice is stored once.
+    local ok2, res = pcall(BattleUI.SaveReplay,
+                           "redcoatz_" .. os.date("%Y-%m-%d_%H-%M-%S"))
+    if ok2 then
+        note("SaveReplay returned " .. tostring(res))
+    else
+        note("SaveReplay raised: " .. tostring(res))
+    end
+    if log then log:close() end
+end
+
+pcall(redcoatz_dump)

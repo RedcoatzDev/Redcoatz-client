@@ -1,0 +1,11 @@
+# Optional. The client runs on the standard library alone; nothing here is
+# required to play.
+#
+# truststore makes Python verify TLS against the Windows certificate store
+# instead of its own bundle. Install it if uploads fail with
+# CERTIFICATE_VERIFY_FAILED, which happens on machines running antivirus that
+# scans HTTPS -- AVG and Avast both do. See nettrust.py.
+truststore>=0.10
+
+# Only for building Redcoatz.exe with build.py, never needed to run the client.
+# pyinstaller>=6
