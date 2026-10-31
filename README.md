@@ -189,12 +189,12 @@ in and restarted (`selfupdate.py`).
 **1. Does this source build the `Redcoatz.exe` on the website?** Two ways to
 know. Build it yourself: the build is deterministic, so the same source with
 the same toolchain gives the same bytes. On the release's tag, with the
-Python, PyInstaller and truststore versions recorded in
-`https://redcoatz.com/client-version.json`, run
+Python version recorded in `https://redcoatz.com/client-version.json`, run
 
     python build.py --verify <built date>
 
-and it prints the SHA-256 of what it built. Or rely on GitHub: the workflow
+and it installs its pinned PyInstaller into a venv of its own, builds, and
+prints the SHA-256 of what it built. Or rely on GitHub: the workflow
 in `.github/workflows/verify.yml` does the same build on GitHub's own
 Windows machines for every release, attaches its exe to the
 release, and compares its hash with the one the website
