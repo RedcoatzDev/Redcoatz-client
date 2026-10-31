@@ -1,0 +1,95 @@
+# Builds Redcoatz.exe from this source on GitHub's own Windows machine,
+# attaches it to the release for the tag, and compares it with the exe the
+# website serves.
+#
+# Runs when a release tag is pushed, and on demand from the Actions tab. The
+# toolchain to use comes from https://redcoatz.com/client-version.json, which
+# build.py writes beside each published exe: the build date (the archive's
+# only timestamp), and the Python, PyInstaller and truststore versions. With
+# those, build.py --verify produces the same bytes, so a matching hash means
+# the exe people download from the website is this source and nothing else.
+#
+# The exe attached to the release is the one built here, so a download from
+# GitHub depends on nothing but this source and GitHub's runner. It is
+# attached whether or not the hashes match: a mismatch means the website's
+# build differs, not that this one is wrong.
+#
+# The comparison is only meaningful when the tag being built is the version
+# the website serves; for any other tag the job still builds and prints its
+# hash, and says the versions differ.
+
+name: Build and verify the exe
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to attach the exe to the release
+
+jobs:
+  rebuild:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read what the website serves
+        shell: pwsh
+        run: |
+          $m = Invoke-RestMethod https://redcoatz.com/client-version.json
+          $src = (Select-String -Path version.py -Pattern '^VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          "SERVED_VERSION=$($m.version)"  >> $env:GITHUB_ENV
+          "SERVED_SHA256=$($m.sha256)"    >> $env:GITHUB_ENV
+          "BUILT=$($m.built)"             >> $env:GITHUB_ENV
+          "PY=$($m.python)"               >> $env:GITHUB_ENV
+          "PYINSTALLER=$($m.pyinstaller)" >> $env:GITHUB_ENV
+          "TRUSTSTORE=$($m.truststore)"   >> $env:GITHUB_ENV
+          "SRC_VERSION=$src"              >> $env:GITHUB_ENV
+          "website serves $($m.version) built $($m.built); this source is $src"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY }}
+
+      - name: Install the recorded toolchain
+        run: pip install "pyinstaller==${{ env.PYINSTALLER }}" "truststore==${{ env.TRUSTSTORE }}"
+
+      - name: Rebuild with the recorded build date
+        run: python build.py --verify ${{ env.BUILT }}
+
+      - name: Compare
+        shell: pwsh
+        run: |
+          $got = (Get-FileHash dist\Redcoatz.exe -Algorithm SHA256).Hash.ToLower()
+          $want = $env:SERVED_SHA256.ToLower()
+          "| | SHA-256 |`n|---|---|`n| rebuilt here | $got |`n| served by redcoatz.com | $want |" >> $env:GITHUB_STEP_SUMMARY
+          if ($env:SRC_VERSION -ne $env:SERVED_VERSION) {
+            "This source is $env:SRC_VERSION and the website serves $env:SERVED_VERSION, so the hashes are not expected to match." >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          if ($got -eq $want) {
+            "**Match.** The exe on redcoatz.com was built from this source." >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "**Mismatch.** The exe on redcoatz.com was not built from this source with this toolchain." >> $env:GITHUB_STEP_SUMMARY
+            exit 1
+          }
+
+      - name: Attach the exe to the release
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          # The release is usually drafted by hand before the tag exists; if
+          # not, make one so the file has somewhere to go.
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) { gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Redcoatz $env:SRC_VERSION" --notes "Built by GitHub Actions from this tag." }
+          gh release upload $tag dist\Redcoatz.exe --repo $env:GITHUB_REPOSITORY --clobber
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Redcoatz-${{ env.SRC_VERSION }}
+          path: dist/Redcoatz.exe
