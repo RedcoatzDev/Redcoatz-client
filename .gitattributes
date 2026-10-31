@@ -1,0 +1,5 @@
+# No line-ending conversion, anywhere, ever. The exe embeds
+# gamefiles/button_rematch.luac byte for byte, and a checkout that turned
+# its LF into CRLF (as Git for Windows does by default, and did on GitHub's
+# runner on 30 October 2026) builds an exe with a different hash.
+* -text
