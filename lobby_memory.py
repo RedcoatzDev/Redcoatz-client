@@ -40,8 +40,6 @@ import ctypes
 import ctypes.wintypes as wt
 import re
 import struct
-
-import mapnames
 import sys
 import time
 
@@ -741,8 +739,8 @@ MAP_RE = re.compile(rb"data/[Bb]attle[Tt]errain/[Pp]resets/([a-z0-9_]+)/")
 #: thumbnail count moves only when the map picker is opened, which a guest
 #: never does, and the browser record exists only for lobbies reached through
 #: the browser list. The Info line is drawn by the lobby on screen, in this
-#: client's own language, so it cannot be stale and it resolves through
-#: mapnames even when the host runs another language build.
+#: client's own language, so it cannot be stale. The names read are sent to
+#: the ladder server, which resolves them (internal/lobby in the ladder).
 
 #: The separator the Info line always uses, in UTF-16. Searched for directly
 #: and walked back from, instead of a regex with a variable-length prefix,
@@ -774,41 +772,26 @@ def info_names(d):
     return out
 
 
-#: What the Info line named on the last reading, as a map key, or None. Kept
-#: beside the reader rather than added to the roster tuple, which every
-#: caller unpacks positionally.
-_info_map = None
+#: Every Info-line map name read on the last pass, duplicates included. Kept
+#: beside the reader rather than added to the roster tuple, which every caller
+#: unpacks positionally. The server wants them all, copies and leftovers
+#: included; it decides what they amount to.
+_info_names = []
 
 
-def info_map():
-    """The lobby's own Info line resolved to a map key, or None.
+def info_names_seen():
+    """The Info-line map names read on the last pass, for the server."""
+    return list(_info_names)
 
-    The best of the three map signals when it answers; see INFO_SEP. Callers
-    should prefer this and fall back to the browser record, then preset
-    counts. Unanimous or silent: every readable copy of the line must name
-    the same map, because a leftover from an earlier lobby cannot be told
-    from the live one by position, and may outnumber it, but it does
-    disagree with it.
+
+def _collect_info(names, d):
+    """Append every Info-line map name in d to names. True if any was found.
+
+    Collects rather than trusting the first hit; the server sorts them out.
     """
-    return _info_map
-
-
-def _note_info(votes, d):
-    """Add every Info-line map name in d to votes. True if any resolved.
-
-    Collects rather than trusting the first hit. The engine packs these
-    strings together, so a match can begin inside the preceding string
-    ("inutesItaly 6-B"); resolving through the name table throws those away.
-    And a previous lobby's Info line can still be lying around, sometimes
-    outnumbering the live one, which is why info_map requires unanimity.
-    """
-    hit = False
-    for shown in info_names(d):
-        key = mapnames.to_key(shown)
-        if key:
-            votes[key] += 1
-            hit = True
-    return hit
+    found = info_names(d)
+    names.extend(found)
+    return bool(found)
 
 
 # How far ahead the thumbnail winner must be. Two is every map's baseline, so
@@ -827,26 +810,19 @@ MAP_MIN_HITS = 3
 LOBBY_LIST_RE = re.compile(
     rb"\x00{4}\x0b[\x05-\x40](ntw3_[a-z0-9_]{4,40})\x00{4}")
 
-# The lobby browser's records. Every open game on the list writes a run
-# holding the host's name, the map as the lobby displays it, the settings,
-# and the host's SteamID64:
-#
-#   Badeblume ... 1813 - Dennewitz ... 36PTS TOW ... 76561198245643380
-#
-# The map is named because somebody is hosting on it, so it cannot be a
-# leftover of our own. Which record is OUR lobby is settled by the roster:
-# the record whose host SteamID is sitting with us is ours. Only fires as a
-# guest; hosting, our lobby is not on our own browser list, and that is when
-# the thumbnail count is right.
+# The lobby browser's records. Every open game on the list writes a run of
+# text that includes the host's SteamID64. The client only cuts the bytes
+# around each SteamID (record_windows); the ladder server reads them and
+# settles which, if any, describes OUR lobby. Only useful as a guest:
+# hosting, our lobby is not on our own browser list, and that is when the
+# thumbnail count is right.
 LOBBY_SID_RE = re.compile(rb"(7656119\d{10})")
 
-# The map name, read by its length byte rather than by a character class,
-# which truncated "1809 - A Coruña" at the first non-ASCII byte.
-LOBBY_TAG_RE = re.compile(rb"\x0b([\x08-\x40])(?=1[6-9]\d{2} - )")
-# How far back from the SteamID the map name sits: about 90 bytes in the
-# captures, 300 is slack. The LAST match before the id is taken so a wider
-# window cannot drag in the previous record's map.
+# The window of bytes around each SteamID that is sent to the ladder server,
+# which reads the record. Nothing about the record's layout is known here;
+# the sizes are what the server asked for.
 LOBBY_LOOKBACK = 300
+RECORD_WINDOW = 30 * 0x20
 # A real listing repeats each map dozens of times; stray single hits are not
 # one.
 LOBBY_LIST_HITS = 10
@@ -1345,9 +1321,9 @@ def read_roster_state(pid=None, include_ai=INCLUDE_AI_DEFAULT):
     all come out of the same pass: the scan already reads every region, so
     counting a few more strings costs only the comparison. save_count is raw
     on purpose; only a caller watching it over time can say what it means
-    (see SAVE_WIDGET). hosts is {host SteamID64: map as displayed} from the
-    browser records, handed back unmatched because the caller has the better
-    roster from live_seats to match it against.
+    (see SAVE_WIDGET). records is the raw windows around every lobby-browser
+    SteamID seen (record_windows), handed back unread for the server, which
+    matches them against the seat array.
     """
     if sys.platform != "win32":
         return [], STATE_UNKNOWN, 0, set(), None, {}, {}
@@ -1371,10 +1347,10 @@ def read_roster_state(pid=None, include_ai=INCLUDE_AI_DEFAULT):
     saves = 0
     maps = Counter()
     listed = Counter()
-    hosts = {}
+    records = []
     record_bases = set()
     results_bases = set()
-    info = Counter()
+    info = []
     markers = [s.encode("utf-16-le") for s in LOBBY_MARKERS]
     slice_start = time.monotonic()
     try:
@@ -1402,7 +1378,7 @@ def read_roster_state(pid=None, include_ai=INCLUDE_AI_DEFAULT):
             # anyway, for one substring test per region.
             if RESULTS_ANCHOR in d:
                 results_bases.add((base, size))
-            if INFO_SEP in d and _note_info(info, d):
+            if INFO_SEP in d and _collect_info(info, d):
                 record_bases.add((base, size))
             if b"ntw3_" in d:
                 hit = False
@@ -1411,13 +1387,8 @@ def read_roster_state(pid=None, include_ai=INCLUDE_AI_DEFAULT):
                     hit = True
                 if hit:
                     record_bases.add((base, size))
-            if b"7656119" in d:
-                for m in LOBBY_SID_RE.finditer(d):
-                    back = d[max(0, m.start() - LOBBY_LOOKBACK):m.start()]
-                    shown = shown_names(back)
-                    if shown:
-                        hosts.setdefault(int(m.group(1)), shown[-1])
-                        record_bases.add((base, size))
+            if b"7656119" in d and _note_records(records, d):
+                record_bases.add((base, size))
             # AI seats, in every region. Restricting this to regions with
             # lobby markers lost seats: the same lobby spreads its rows
             # across several regions, some carrying no marker.
@@ -1458,17 +1429,17 @@ def read_roster_state(pid=None, include_ai=INCLUDE_AI_DEFAULT):
     state = STATE_LOBBY if widget >= LOBBY_WIDGET_MIN else STATE_BATTLE
     if in_lobby(pid):
         state = STATE_LOBBY
-    # hosts is handed back rather than resolved here. Matching it needs the
-    # roster, and the roster this function returns is the weaker of the two
-    # the client has; the caller has live_seats, which walks the seat array.
-    global _map_bases, _results_bases, _info_map
+    # records is handed back unread. Matching it needs the roster, and the
+    # roster this function returns is the weaker of the two the client has;
+    # the caller has live_seats, and the server does the matching.
+    global _map_bases, _results_bases, _info_names
     _map_bases = record_bases
     _results_bases = results_bases
-    _info_map = next(iter(info)) if len(info) == 1 else None
+    _info_names = info
     # Empty, deliberately. The dialogs are read by scan_battle_signals during
     # the battle, which is the only time they can be on screen.
     signals = {}
-    return out, state, saves, widget_bases, pick_map(maps, listed), hosts, signals
+    return out, state, saves, widget_bases, pick_map(maps, listed), records, signals
 
 
 #: The end-of-battle results table's column header, in UTF-16. Chosen as the
@@ -1496,33 +1467,73 @@ def results_regions():
 _map_bases = set()
 
 
-def read_map(pid=None, hints=None):
-    """(map_key, hosts) from the cached regions only. Milliseconds, not seconds.
+def scan_records(pid=None):
+    """The lobby browser's records, from a walk of the whole process.
 
-    Opens the process read-only and re-reads only the regions that held
-    lobby records last time, cheaply enough to run between full scans.
-    Returns (None, {}) when the hints yield nothing; that is not an error, the
-    caller should keep taking the full reading periodically.
+    Opens the process read-only. Returns the raw windows record_windows cuts,
+    and remembers the regions that held records so read_map can re-read them
+    in milliseconds afterwards.
+
+    The full scan used to be the only thing that found these regions, and it
+    no longer runs while a lobby is on screen. A client started with the game
+    already in a lobby therefore never learnt where the records were, and
+    showed no map for a guest whose lobby line could not be read (5 November
+    2026, Austerlitz hosted in English). This walk looks for nothing else, so
+    it costs about a second, paced like the full scan.
     """
     if sys.platform != "win32":
-        return None, {}
+        return []
     if pid is None:
         pid, _ = find_game()
     if not pid:
-        return None, {}
+        return []
+    h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not h:
+        return []
+    records, bases = [], set()
+    slice_start = time.monotonic()
+    try:
+        for base, size in _regions(h):
+            if time.monotonic() - slice_start >= SCAN_SLICE:
+                time.sleep(SCAN_PAUSE)
+                slice_start = time.monotonic()
+            d = _read(h, base, size)
+            if d and b"7656119" in d and _note_records(records, d):
+                bases.add((base, size))
+    finally:
+        k32.CloseHandle(h)
+    global _map_bases
+    _map_bases = set(_map_bases) | bases
+    return records
+
+
+def read_map(pid=None, hints=None):
+    """(map_key, records) from the cached regions only. Milliseconds, not seconds.
+
+    Opens the process read-only and re-reads only the regions that held
+    lobby records last time, cheaply enough to run between full scans.
+    Returns (None, []) when the hints yield nothing; that is not an error, the
+    caller should keep taking the full reading periodically.
+    """
+    if sys.platform != "win32":
+        return None, []
+    if pid is None:
+        pid, _ = find_game()
+    if not pid:
+        return None, []
     bases = hints if hints is not None else _map_bases
     if not bases:
-        return None, {}
+        return None, []
 
     from collections import Counter
 
     h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                         False, pid)
     if not h:
-        return None, {}
+        return None, []
     listed = Counter()
-    hosts = {}
-    info = Counter()
+    records = []
+    info = []
     try:
         for base, size in bases:
             # Read the address directly rather than re-enumerating: if the
@@ -1531,61 +1542,23 @@ def read_map(pid=None, hints=None):
             if not d:
                 continue
             if INFO_SEP in d:
-                _note_info(info, d)
+                _collect_info(info, d)
             if b"ntw3_" in d:
                 for m in LOBBY_LIST_RE.finditer(d):
                     listed[m.group(1).decode("ascii", "replace")] += 1
             if b"7656119" in d:
-                for m in LOBBY_SID_RE.finditer(d):
-                    back = d[max(0, m.start() - LOBBY_LOOKBACK):m.start()]
-                    shown = shown_names(back)
-                    if shown:
-                        hosts.setdefault(int(m.group(1)), shown[-1])
+                _note_records(records, d)
     finally:
         k32.CloseHandle(h)
 
     # Cleared rather than left alone when nothing was seen: leaving the last
     # answer standing would keep naming a lobby the player has already left.
-    global _info_map
-    _info_map = next(iter(info)) if len(info) == 1 else None
+    global _info_names
+    _info_names = info
 
     # Only the browser-list signal is available here; the thumbnail count is
     # the hosting case, which a full pass covers.
-    return pick_map(Counter(), listed), hosts
-
-
-def shown_names(buf):
-    """Every "<year> - <Map>" tagged string in buf, in order.
-
-    Read by the length byte, so an accented letter is carried through.
-    Decoded as UTF-8 with a Latin-1 fallback; the server folds accents when
-    matching, so either spelling finds the map.
-    """
-    out = []
-    for m in LOBBY_TAG_RE.finditer(buf):
-        n = buf[m.start(1)] - 1
-        raw = buf[m.end(1):m.end(1) + n]
-        if len(raw) < n:
-            continue
-        try:
-            out.append(raw.decode("utf-8").strip())
-        except UnicodeDecodeError:
-            out.append(raw.decode("latin-1").strip())
-    return out
-
-
-def pick_lobby_map(hosts, sids):
-    """The map of the lobby we are in, from the browser records. None if unsure.
-
-    hosts is {host SteamID64: map as displayed}, one entry per open game on
-    the browser list. sids is who is sitting in the lobby with us. Our host
-    is one of them, so the record they own names our map. Requires a single
-    answer; picking between two would be a guess.
-    """
-    if not hosts or not sids:
-        return None
-    mine = {name for sid, name in hosts.items() if sid in sids}
-    return mine.pop() if len(mine) == 1 else None
+    return pick_map(Counter(), listed), records
 
 
 #: Lobby-record hits needed before that signal is believed. Hosting our own
@@ -1597,6 +1570,28 @@ LIST_MIN_HITS = 5
 #: far more than one merely listed beside it; when the top of the list is a
 #: photo finish, none of them is our lobby.
 LIST_MIN_LEAD = 1.5
+
+
+def record_windows(d):
+    """The bytes around every lobby-browser SteamID in d, for the server.
+
+    LOBBY_LOOKBACK bytes before each id and RECORD_WINDOW after, read on the
+    ladder server. Each window is about a kilobyte and a browser list has a
+    few dozen entries, so a lobby's worth is tens of kilobytes, sent only
+    when it changes.
+    """
+    out = []
+    for m in LOBBY_SID_RE.finditer(d):
+        s = m.start()
+        out.append(d[max(0, s - LOBBY_LOOKBACK): s + 17 + RECORD_WINDOW])
+    return out
+
+
+def _note_records(records, d):
+    """Append record_windows(d) to records. True if any was cut."""
+    found = record_windows(d)
+    records.extend(found)
+    return bool(found)
 
 
 def pick_map(counts, listed=None):

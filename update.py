@@ -174,11 +174,20 @@ def banned_gui(info, parent=None):
     win.title("Redcoatz")
     win.configure(bg="#10131C")
     win.minsize(520, 240)
-    tk.Label(win, text="Banned from Redcoatz", bg="#10131C", fg="#E4C67E",
+    # Two kinds of notice share this screen. The gold ban is the original;
+    # a suspension (server/suspend.go) is a person's decision for conduct,
+    # with a date, and the server words the reason so it is shown as sent.
+    suspended = info.get("kind") == "suspended"
+    title = "Suspended from Redcoatz" if suspended else "Banned from Redcoatz"
+    if suspended:
+        body = ("This account is " + str(info.get("reason") or "suspended") +
+                ". Redcoatz will run again after that date.")
+    else:
+        body = ("This player is banned from Redcoatz for cheating. They "
+                "brought more than the 10,000 allowable gold.")
+    tk.Label(win, text=title, bg="#10131C", fg="#E4C67E",
              font=("Georgia", 16, "bold")).pack(pady=(26, 14))
-    tk.Label(win,
-             text=("This player is banned from Redcoatz for cheating. They "
-                   "brought more than the 10,000 allowable gold."),
+    tk.Label(win, text=body,
              bg="#10131C", fg="#ECE6D7", font=("Georgia", 11),
              wraplength=460, justify="center").pack(padx=30)
     lines = []

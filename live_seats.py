@@ -11,11 +11,11 @@ What it touches. The process is Napoleon.exe, found by name through
 lobby_memory.find_game. Every reader here opens it with
 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ only and closes the handle before
 returning. Memory is read with ReadProcessMemory and never written. What is
-read is the lobby's seat array: each player's display name, SteamID64,
-alliance and position, army preset, and the lobby's configured size. Nothing
-is written to disk. The values are returned to the caller; the overlay
-(ladder_overlay.py) shows them in its panel and includes them in the game
-start and end reports it sends to the ladder server.
+read is the lobby's seat array: each player's display name, SteamID64, army
+preset, the raw seat record, and the lobby's configured size. Nothing is
+written to disk. The values are returned to the caller; the overlay
+(ladder_overlay.py) sends the raw records to the ladder server, which decodes
+who sits where and answers with the standings it shows in its panel.
 
 The seat array is located again on every poll. Its address changes when the
 roster changes, so a cached address keeps decoding whoever was seated when it
@@ -29,8 +29,7 @@ import time
 
 from lobby_memory import (find_game, k32, find_roster_array, roster_owner,
                           PROCESS_QUERY_INFORMATION, PROCESS_VM_READ)
-from roster import (LiveSource, lobby_armies, lobby_capacity, lobby_roster,
-                    lobby_seats, lobby_seats_detail)
+from roster import LiveSource, lobby_capacity, lobby_roster, seat_records_raw
 
 
 def read_roster(local=None, pid=None):
@@ -68,15 +67,11 @@ def read_roster(local=None, pid=None):
 _ARRAY_HINTS = set()
 
 
-def read_seats(pid=None, detail=False):
-    """[(name, steamid64, alliance, position)] for the lobby now.
+def read_seats_raw(pid=None):
+    """[(index, steamid64, name, army, raw)] for the lobby now, for the server.
 
-    The richer form of read_roster: same players, plus which alliance each is
-    in and where they sit in it. With `detail`, also the raw byte those two
-    were decoded from and the seat's index in the array (see
-    roster.lobby_seats_detail). Both are 0-based, and the position is the
-    deployment slot on the map, not the order the lobby lists players in.
-    See roster.TEAM_OFF. Opens the game process read-only.
+    See roster.seat_records_raw: the alliance and box are not decoded here.
+    Opens the game process read-only.
     """
     if sys.platform != "win32":
         return []
@@ -98,8 +93,7 @@ def read_seats(pid=None, detail=False):
         if bases:
             _ARRAY_HINTS.clear()
             _ARRAY_HINTS.update(bases)
-        return (lobby_seats_detail(LiveSource(h), arr or None) if detail
-                else lobby_seats(LiveSource(h), arr or None))
+        return seat_records_raw(LiveSource(h), arr or None)
     finally:
         k32.CloseHandle(h)
 
@@ -132,34 +126,6 @@ def read_capacity(pid=None):
         k32.CloseHandle(h)
 
 
-def read_armies(pid=None):
-    """{name: army key} for the lobby now, or {}.
-
-    A separate call rather than another field on read_seats because the army
-    reading is unconfirmed (see roster.ARMY_OFF); failing here costs the army
-    and nothing else. Opens the game process read-only.
-    """
-    if sys.platform != "win32":
-        return {}
-    if pid is None:
-        pid, _ = find_game()
-    if not pid:
-        return {}
-    h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
-    if not h:
-        return {}
-    try:
-        arr, bases = find_roster_array(pid, hints=_ARRAY_HINTS or None)
-        if not arr and _ARRAY_HINTS:
-            arr, bases = find_roster_array(pid, hints=set())
-        if bases:
-            _ARRAY_HINTS.clear()
-            _ARRAY_HINTS.update(bases)
-        return lobby_armies(LiveSource(h), arr or None)
-    finally:
-        k32.CloseHandle(h)
-
-
 def main():
     """Command-line entry: print the lobby roster, once or repeatedly."""
     try:
@@ -182,10 +148,9 @@ def main():
         size = f"lobby {cap[0]}v{cap[1]}  " if cap else ""
         print(f"\n--- {time.strftime('%H:%M:%S')}  {len(names)} players  "
               f"{size}{(time.time() - t0) * 1000:.0f} ms")
-        for n, sid, team, pos in read_seats():
-            where = ("?" if team is None
-                     else f"alliance {team + 1} seat {pos + 1}")
-            print(f"   {n:34s} {sid}  {where}")
+        for index, sid, n, army, _raw in read_seats_raw():
+            # The alliance and box are read by the server, not here.
+            print(f"   {n:34s} {sid}  #{index + 1}  {army}")
         if not names:
             print("   no lobby open")
         if not args.watch:

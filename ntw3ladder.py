@@ -258,6 +258,9 @@ def main():
                     help="full path to the NTW3 launcher, if it is not found")
     ap.add_argument("--no-fix23e", action="store_true",
                     help="do not offer to repair the 23e bug in variants94b.pack")
+    ap.add_argument("--no-ntw3-check", action="store_true",
+                    help="do not ask a player on the 9.6 packs to install "
+                         "NTW3 9.6.1")
     ap.add_argument("--no-results-hook", action="store_true",
                     help="do not install the script that hands the client the "
                          "game's own battle results and saves every replay")
@@ -356,6 +359,7 @@ def main():
     # The newest version the server advertises, if newer than this one. Shown
     # in the panel's title bar rather than in a dialog.
     update_to = None
+    info = {}
     player_name, player_sid = None, None
 
     if not args.demo:
@@ -529,15 +533,56 @@ def main():
             step(f"fixbuffer restore check failed: {e!r}")
 
         todo = []
+        states = {}
         for name, describe in wanted:
             try:
                 mod = __import__(name)
                 st = mod.status()
+                states[name] = st["state"]
                 step(f"  {name}: {st['state']} -- {st['detail']}")
                 if st["state"] == mod.STOCK:
                     todo.append((mod, describe(st)))
             except Exception as e:            # noqa: BLE001
                 step(f"  {name} check failed, continuing without it: {e!r}")
+
+        # NTW3 9.6.1 repairs the texture crashes in the packs themselves, and
+        # the ladder wants everyone on it. A player still on the 9.6 packs
+        # (fix23e "stock" or "fixed") is sent to the download; whether they
+        # may carry on without it is the server's call. See ntw3check.py.
+        # Before the repairs below: a player who goes to install it has no
+        # use for the 23e repair, and one who declines still owes it.
+        if not args.no_fix23e and not args.no_ntw3_check:
+            try:
+                import ntw3check
+                d = ntw3check.decide(states.get("fix23e"), info)
+                if d:
+                    step(f"ntw3 check: {d['action']} {d['version']} "
+                         f"url={d['url'] or '(none)'}")
+                    choice = ntw3check.prompt(d, parent=root, log=step)
+                    step(f"ntw3 check: player chose {choice}")
+                    if choice != ntw3check.LATER:
+                        from tkinter import messagebox
+                        if choice == ntw3check.GET:
+                            messagebox.showinfo(
+                                "NTW3 Ladder",
+                                "Redcoatz has closed so the installer can "
+                                "run. Install NTW3 %s with Napoleon closed, "
+                                "then start Redcoatz again." % d["version"],
+                                parent=root)
+                        else:
+                            messagebox.showinfo(
+                                "NTW3 Ladder",
+                                "Redcoatz only runs on NTW3 %s, so it has "
+                                "closed. Nothing was changed and nothing was "
+                                "uploaded." % d["version"],
+                                parent=root)
+                        root.destroy()
+                        return 4
+                else:
+                    step("ntw3 check: nothing to say")
+            except Exception as e:            # noqa: BLE001
+                # The dialog failed, not the player's choice: carry on.
+                step(f"ntw3 check failed, continuing without it: {e!r}")
 
         # Required, not offered: a patched and an unpatched game desync at
         # the moment the bug would have fired, so the ladder runs only on a
@@ -666,20 +711,55 @@ def main():
         except Exception as e:                # noqa: BLE001
             step(f"results hook skipped: {e!r}")
 
-    # Start the game last, once the terms are settled and the first upload is
-    # done, so the launcher does not cover the windows the player must answer.
-    if not args.demo and not args.no_game:
-        step("starting NTW3")
-        started, msg = gamelaunch.start_game(args.game_path)
-        step(f"game: {msg}")
-        # Not fatal either way: a player who already had NTW3 open still gets
-        # a working panel.
-
+    # The panel first, so it is on screen for the launch: what the launcher
+    # is doing (starting Steam, waiting for it to sign in) is written in its
+    # footer, and nothing pops up over it. It stays up until the battle
+    # starts or the player collapses it by hand.
     step("building the panel")
-    Overlay(root, args.server, demo=args.demo, scale=args.scale,
-            watch_game=not args.no_auto_hide, update_to=update_to)
+    panel = Overlay(root, args.server, demo=args.demo, scale=args.scale,
+                    watch_game=not args.no_auto_hide, update_to=update_to)
     root.deiconify()
     step("panel is up; running")
+
+    # Start the game last, once the terms are settled and the first upload is
+    # done, so the launcher does not cover the windows the player must answer.
+    # On its own thread: the wait for Steam can run a minute, and the panel
+    # has to keep drawing through it. Progress goes to the footer via the Tk
+    # thread.
+    if not args.demo and not args.no_game:
+        def note(text):
+            root.after(0, panel.set_launch_note, text)
+
+        def launch():
+            step("starting NTW3")
+            note("starting NTW3")
+            try:
+                _, msg = gamelaunch.start_game(args.game_path, log=step,
+                                               status=note)
+                if msg == gamelaunch.ALREADY_RUNNING:
+                    # A game that is still on its way out counts as running
+                    # for a few seconds after the player quit it; a client
+                    # started in that window (1 November 2026: quit the game,
+                    # start the client, no launcher) must not give up on it.
+                    # Watch for a short while and launch if it goes.
+                    note("NTW3 is already running")
+                    deadline = time.monotonic() + gamelaunch.EXIT_GRACE
+                    while time.monotonic() < deadline:
+                        time.sleep(1)
+                        if not gamelaunch.already_running():
+                            step("the running game has exited; starting NTW3")
+                            _, msg = gamelaunch.start_game(
+                                args.game_path, log=step, status=note)
+                            break
+            except Exception as e:            # noqa: BLE001 - never fatal
+                msg = f"launch failed: {e!r}"
+            step(f"game: {msg}")
+            # Not fatal either way: a player who already had NTW3 open still
+            # gets a working panel. The note is cleared so the footer goes
+            # back to reporting the game itself.
+            note("")
+
+        threading.Thread(target=launch, name="launch", daemon=True).start()
     try:
         root.mainloop()
     finally:
