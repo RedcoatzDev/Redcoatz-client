@@ -8,9 +8,10 @@ What it touches. This module opens no process itself. LiveSource reads through
 a handle the caller opened (see live_seats.py) using ReadProcessMemory only;
 nothing is ever written to the game. DumpSource opens a capture file on disk
 read-only, at a path the caller supplies (test captures). What is decoded is
-the lobby's seat array: each player's display name, SteamID64, alliance and
-position, army preset, and the lobby's configured size. Nothing is written to
-disk or sent anywhere; results are returned to the caller.
+the lobby's seat array: each player's display name, SteamID64, army preset,
+the raw seat record (the ladder server decodes the alliance and position from
+it), and the lobby's configured size. Nothing is written to disk; results are
+returned to the caller, who sends the raw records to the server.
 
 # The algorithm
 
@@ -331,46 +332,6 @@ def anchored(mem, a, limit=16):
     return False
 
 
-#: Byte in the seat record holding the lobby's own view of who is where.
-#: Two fields packed into one byte:
-#:     bit 0        which alliance, 0 or 1
-#:     bits 2-3     the player's position within that alliance, 0-3
-#:
-#: The position is the deployment slot (which box on the map the player forms
-#: up in). It is not join order and not the order the lobby lists people in,
-#: both of which were believed at one point and disproved by captures. Found
-#: by testing every bit position in the record against a lobby read off the
-#: screen; checked against every capture in test/, where 40 of the 43 with
-#: seats decode to alliances whose positions are exactly 0..n-1.
-TEAM_OFF = 0x54
-
-
-def team_of(mem, a):
-    """(alliance, position) for the seat at `a`, or (None, None).
-
-    Both are 0-based. Alliance 0 is drawn first, as "Alliance 1". The split
-    of the byte is an inference, not something the game documents: it can
-    express only two alliances and four slots, and bit 1 is ignored. A fifth
-    slot or a third alliance would wrap silently, which is why seat_byte
-    exists and the raw value is reported for the server to check against the
-    replay.
-    """
-    b = seat_byte(mem, a)
-    if b is None:
-        return None, None
-    return b & 1, (b >> 2) & 3
-
-
-def seat_byte(mem, a):
-    """The raw byte the alliance and position are decoded from, or None.
-
-    Reported alongside the decoded values so a wrong reading can be diagnosed
-    from the archive, against the replay's record of where people deployed.
-    """
-    b = mem.read(a + TEAM_OFF, 1)
-    return b[0] if b else None
-
-
 #: The army pointer, relative to the seat's SteamID.
 #:
 #: NOT CONFIRMED against a lobby screen. A string sits here in every capture
@@ -410,7 +371,7 @@ def army_at(mem, a):
 def lobby_armies(mem, array=None):
     """{name: army key} for the lobby now.
 
-    A separate call rather than another field on lobby_seats_detail, so an
+    A separate call rather than another field on seat_records_raw, so an
     unconfirmed reading does not widen a tuple that is unpacked in several
     places.
     """
@@ -550,32 +511,18 @@ def _records_from_array(mem, array):
     return out
 
 
-def lobby_seats(mem, array=None):
-    """[(name, steamid64, alliance, position)] for the lobby now.
+def seat_records_raw(mem, array=None):
+    """[(index, steamid64, name, army, raw)] for the lobby now, for the server.
 
-    Same players as lobby_roster, with where each one is sitting. `array` is
-    passed through to seat_records.
-    """
-    hits = seat_records(mem, array)
-    seen, out = set(), []
-    for a, sid, name in hits:
-        if sid in seen or not anchored(mem, a):
-            continue
-        seen.add(sid)
-        team, pos = team_of(mem, a)
-        out.append((name, sid, team, pos))
-    return out
+    raw is the record's STRIDE bytes from the SteamID onward, exactly as the
+    game holds them; army is the preset its pointer leads to, or ""; index is
+    the seat's position in the array when the array is known, else the
+    record's rank in the sweep.
 
-
-def lobby_seats_detail(mem, array=None):
-    """As lobby_seats, plus the raw byte and the seat's index in the array.
-
-    [(name, steamid64, alliance, position, raw_byte, index)]
-
-    Kept separate from lobby_seats so the shape everything already unpacks
-    does not change. The two extra values make a wrong reading diagnosable:
-    the raw byte is what the game stored, and the index is where the seat sat
-    in the array, which is not the deployment slot.
+    Which alliance and box a seat is in is not read here. The ladder server
+    reads it from the record (POST /v1/lobby), so the reading can be
+    corrected for every player at once rather than one client build at a
+    time. Nothing about the record beyond the two pointers is known here.
     """
     hits = seat_records(mem, array)
     seen, out = set(), []
@@ -583,35 +530,10 @@ def lobby_seats_detail(mem, array=None):
         if sid in seen or not anchored(mem, a):
             continue
         seen.add(sid)
-        team, pos = team_of(mem, a)
-        out.append((name, sid, team, pos, seat_byte(mem, a),
-                    (a - array - ARRAY_FIRST) // STRIDE if array else idx))
+        raw = mem.read(a, STRIDE) or b""
+        index = (a - array - ARRAY_FIRST) // STRIDE if array else idx
+        out.append((index, sid, name, army_at(mem, a) or "", raw))
     return out
-
-
-def seat_faults(seats):
-    """Alliances whose seat numbers are not 1..n. Empty when the lobby is fine.
-
-    A healthy lobby gives each alliance a run of seats with no holes, and
-    every capture in test/ does. Against a capture, a gap means the roster
-    was misread. Against a live lobby whose roster is otherwise stable, it
-    means players left and the game kept their slots as vacated; such a lobby
-    may refuse to start, which is worth telling the player. Duplicates count
-    as a fault too: two players cannot deploy in one box.
-    """
-    by = {}
-    # Sliced, not unpacked: lobby_seats gives four fields and
-    # lobby_seats_detail gives six, and this is handed either.
-    for seat in seats:
-        team, pos = seat[2], seat[3]
-        if team is None or pos is None:
-            continue
-        by.setdefault(team, []).append(pos)
-    bad = []
-    for team, taken in by.items():
-        if sorted(taken) != list(range(len(taken))):
-            bad.append(team)
-    return sorted(bad)
 
 
 def lobby_roster(mem, local=None, array=None):

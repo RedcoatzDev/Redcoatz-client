@@ -38,6 +38,8 @@ What this module touches outside its own window:
 import argparse
 import ctypes
 import ctypes.wintypes as wintypes
+import base64
+import hashlib
 import json
 import math
 import re
@@ -63,10 +65,8 @@ import consent  # noqa: E402
 import firstsync  # noqa: E402
 from version import VERSION, USER_AGENT  # noqa: E402
 import steamauth  # noqa: E402
-import mapnames  # noqa: E402
 # The function, not the module: Poller.run rebinds `roster` to a local list,
 # which would shadow the module.
-from roster import seat_faults  # noqa: E402
 
 try:
     from lobby_memory import (read_roster_state, save_button_showing,
@@ -80,9 +80,9 @@ try:
                               read_results_screen, RESULT_WORDS, SAVE_TEXT,
                               is_verdict,
                               RESULTS_TEXT,
-                              pick_lobby_map, read_map, results_regions,
+                              read_map, scan_records, results_regions,
                               region_set,
-                              find_game, info_map,
+                              find_game, info_names_seen,
                               LOBBY_WIDGET_MIN,
                               STATE_LOBBY, STATE_BATTLE, STATE_UNKNOWN,
                               SAVE_NEW_MIN, HOST_LEFT_NEW, DROPPED_NEW,
@@ -122,10 +122,10 @@ except Exception:                      # pragma: no cover - platform fallback
 
     def read_roster_state():
         # Seven values, matching the real one; the call site unpacks them.
-        return [], STATE_UNKNOWN, 0, set(), None, {}, {}
+        return [], STATE_UNKNOWN, 0, set(), None, [], {}
 
     def read_map(pid=None, hints=None):
-        return None, {}
+        return None, []
 
     def results_regions():
         return set()
@@ -136,11 +136,11 @@ except Exception:                      # pragma: no cover - platform fallback
     def find_game():
         return None, ""
 
-    def info_map():
-        return None
+    def info_names_seen():
+        return []
 
-    def pick_lobby_map(hosts, sids):
-        return None
+    def scan_records(pid=None):
+        return []
 
     def save_button_showing(saves, baseline):
         return False
@@ -344,6 +344,12 @@ HEARTBEAT_SECONDS = 300
 # held lobby records last time. A few milliseconds against seconds for a full
 # pass, so a map change shows in about a second.
 MAP_RECHECK_SECONDS = 0.5
+#: How long after a walk for the host's browser record before the next one,
+#: while a lobby's map is still unknown: this long at first, doubling to the
+#: maximum. Hosting our own game there is no record to find, so the walk must
+#: not repeat every pass.
+HOST_SCAN_SECONDS = 8
+HOST_SCAN_MAX_SECONDS = 60
 
 # AI seats are always "CPU <n>"; every other seat is a human with a Steam name.
 AI_NAME = re.compile(r"^CPU \d+$", re.I)
@@ -800,6 +806,52 @@ def game_is_running():
         return None
 
 
+def post_lobby(server, payload, me="", timeout=10):
+    """POST /v1/lobby: the lobby as read, for the server to interpret.
+
+    The seat records and browser-record windows go as base64; the server
+    decodes who sits where and which map the lobby is on (internal/lobby in
+    the ladder), and answers with the standings the panel draws. Raises on
+    any failure, like _fetch.
+    """
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    req = urllib.request.Request(
+        f"{server}/v1/lobby", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": USER_AGENT,
+                 "X-Player": me or "",
+                 **steamauth.headers()})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+#: Displayed map name -> preset key, as the server answered. A name that
+#: could not be asked about is not cached, so it is asked again.
+_KEY_CACHE = {}
+
+
+def resolve_map_name(server, shown):
+    """The preset key for a map name the lobby displays, or "" when unknown.
+
+    Asked of the server (which holds the name table for every language it
+    knows) once per name; a key passes straight through. "" when the server
+    does not know the name or cannot be reached.
+    """
+    shown = (shown or "").strip()
+    if not shown:
+        return ""
+    if shown in _KEY_CACHE:
+        return _KEY_CACHE[shown]
+    if not signed_in():
+        return ""
+    try:
+        key = post_lobby(server, {"shown": shown, "in_lobby": True}).get("map") or ""
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return ""
+    _KEY_CACHE[shown] = key
+    return key
+
+
 class MapWatcher(threading.Thread):
     """Name the lobby's map on its own clock, by reading the game's memory.
 
@@ -810,11 +862,13 @@ class MapWatcher(threading.Thread):
     because they say where to look, not what the answer is.
     """
 
-    def __init__(self, out, interval=MAP_SAMPLE_SECONDS):
-        """out is the queue to the panel; interval the seconds between passes."""
+    def __init__(self, out, interval=MAP_SAMPLE_SECONDS, server=""):
+        """out is the queue to the panel; interval the seconds between passes;
+        server resolves the drawn name to a key (resolve_map_name)."""
         super().__init__(daemon=True)
         self.out = out
         self.interval = interval
+        self.server = server
         self._stop = threading.Event()
         self._last = None
         self._map = ""
@@ -871,7 +925,7 @@ class MapWatcher(threading.Thread):
                              or map_from_status(status_text(pid) or ""))
                     if named:
                         self._map = named
-                key = mapnames.to_key(self._map) if self._map else None
+                key = resolve_map_name(self.server, self._map) if self._map else None
                 if key and key != self._last:
                     self._last = key
                     self.out.put(("map", key))
@@ -902,6 +956,8 @@ class Poller(threading.Thread):
         # it has, a low widget count means "not playing multiplayer", not "in
         # a battle". See run().
         self._seen_lobby = False
+        # The map line the lobby last drew, "" when none has been read.
+        self._status_map = ""
         # Whether a lobby has been read properly since the last battle
         # started. A start is only reported off the back of one.
         self._lobby_confirmed = False
@@ -919,6 +975,15 @@ class Poller(threading.Thread):
         # The lobby as last read, from which a start report is built once the
         # game is in a battle and the lobby is gone from memory.
         self._lobby_snapshot = None
+        # Every change of seating seen in the lobby, for the start report.
+        # See the "seats:" log line in the poll loop.
+        self._seat_log = []
+        # The lobby as last read (seats, records, map signals), the
+        # fingerprint of the last reading the server answered, and the
+        # faults its last answer named. See _post_reading.
+        self._reading = None
+        self._lobby_sent = None
+        self._faults_seen = []
         # The battle now being fought. An ending has to name the same battle:
         # the server keys a battle on its map and roster.
         self._battle = None
@@ -1367,8 +1432,8 @@ class Poller(threading.Thread):
                 self.out.put(("map", None))
                 self._stop.wait(2.0)
                 continue
-            blank = ([], STATE_UNKNOWN, 0, set(), None, {}, {})
-            roster, state, saves, bases, map_key, hosts, signals = blank
+            blank = ([], STATE_UNKNOWN, 0, set(), None, [], {})
+            roster, state, saves, bases, map_key, records, signals = blank
             # Set inside the try, read well after it.
             by_pointer = False
             pid, fighting = None, None
@@ -1418,7 +1483,7 @@ class Poller(threading.Thread):
                 elif not fighting:
                     # Neither marker, and at least one could not be read. The
                     # scan runs for the roster, hosts and map.
-                    (roster, state, saves, bases, map_key, hosts,
+                    (roster, state, saves, bases, map_key, records,
                      signals) = read_roster_state()
                     # False means the widget table was read and held no battle
                     # widget, which overrules the scan's count. None means it
@@ -1428,7 +1493,7 @@ class Poller(threading.Thread):
             except Exception:
                 # The game closing mid-scan, antivirus interference, a missing
                 # privilege: none of them should take the panel down.
-                roster, state, saves, bases, map_key, hosts, signals = blank
+                roster, state, saves, bases, map_key, records, signals = blank
             # THE ONE WRITE TO THE GAME'S MEMORY. artilleryfix.apply patches
             # a known crash (a target buffer overrun) in the running game's
             # code, once per game process, and only when the widget table was
@@ -1507,64 +1572,40 @@ class Poller(threading.Thread):
             ai = [n for n, s in roster if not s]
 
             # The seat array (live_seats) is exact and carries SteamIDs, so
-            # when it returns anything it replaces the scanned humans.
-            lobby_seats = {}
-            # Defined out here: seat_place reads it on every path.
-            seat_raw = {}
-            # What army each seat brought. Read separately and allowed to fail
-            # on its own: the offset is unverified (see roster.ARMY_OFF), so
-            # it is reported for checking against replays and nothing depends
-            # on it.
-            seat_army = {}
-            # Who opened the lobby: the first record of the seat array.
-            seat_host = ""
+            # when it returns anything it replaces the scanned humans. Each
+            # record goes to the server as read (roster.seat_records_raw),
+            # which says who sits where. Not after leaving a lobby: the seat
+            # array keeps its last occupants too.
+            raw_seats = []
             # For _wait_watching_map, which runs between passes.
             self._stale_lobby = stale_lobby
-            # Read below by seat_faults whether or not the reader ran.
-            seats = []
-            # Not after leaving a lobby: the seat array keeps its last
-            # occupants too.
             if live_seats is not None and not stale_lobby:
                 try:
-                    seats = live_seats.read_seats(detail=True)
-                    if seats:
-                        first = min(seats, key=lambda s: s[5])
-                        if first[5] == 0 and first[1]:
-                            seat_host = str(first[1])
-                        humans = [(n, sid) for n, sid, _t, _p, _r, _i in seats]
+                    raw_seats = live_seats.read_seats_raw()
+                    if raw_seats:
                         # The AI seats are not cleared: this reader finds
                         # seats by SteamID and a CPU has none. A stale CPU
                         # from the scan only misdescribes a lobby; AI seats
                         # are kept out of the battle key and every rating.
-                        # Where each player sits, so the panel can draw the
-                        # lobby's own arrangement.
-                        lobby_seats = {n: (t, ps)
-                                       for n, _s, t, ps, _r, _i in seats
-                                       if t is not None and ps is not None}
-                        # The raw byte the alliance and slot were decoded from
-                        # (the split is an inference, see roster.team_of) and
-                        # the seat's index, reported so a wrong slot can be
-                        # diagnosed against replays.
-                        seat_raw = {n: (r, i) for n, _s, _t, _p, r, i in seats}
+                        humans = [(n, sid) for _i, sid, n, _a, _r in raw_seats]
                 except Exception:
-                    pass
-                try:
-                    seat_army = live_seats.read_armies() or {}
-                except Exception:
-                    seat_army = {}
+                    raw_seats = []
 
             # The end-of-battle table, while it is still on screen and the
             # scan above has just located it. Opt-in; see _maybe_save_results.
             self._maybe_save_results(roster, map_key)
 
-            # The map. Three signals, weakest last: the line the lobby itself
-            # is drawing, then the server-browser record of the host sitting
-            # in this lobby, then the thumbnail count (map_key), which is
-            # stale exactly when a record matches. A browser record carries
-            # the map name in the host's language, so it is resolved to a key
-            # before it is believed.
-            shown = (None if stale_lobby else
-                     pick_lobby_map(hosts, {sid for _, sid in humans if sid}))
+            # The map signals, gathered here and weighed on the server: the
+            # line the lobby itself is drawing, the Info line, the browser
+            # records, and the thumbnail count (map_key). The full scan is
+            # skipped in a lobby, so there the records come from the regions
+            # last known to hold them (see scan_records, which the map
+            # watcher runs when those are not known yet).
+            if state == STATE_LOBBY and not records and not stale_lobby:
+                try:
+                    records = read_map()[1]
+                except Exception:
+                    records = []
             # The drawn line is read each pass rather than remembered: every
             # map line the game has ever shown is still in memory, and only
             # the live lobby draws. Cleared the moment the lobby is off
@@ -1575,32 +1616,31 @@ class Poller(threading.Thread):
                 self._status_map = ""
                 forget_map_widget()
             named = getattr(self, "_status_map", "")
-            if state == STATE_LOBBY:
-                # In a lobby the drawn line is the only answer taken, with one
-                # exception that is not a count: the browser record of the
-                # host sitting in this lobby, which names it by construction.
-                # The counting fallbacks are wrong exactly when it matters (a
-                # new lobby named after the one before it), and a confident
-                # wrong map is recorded against the battle for good.
-                if named:
-                    key = mapnames.to_key(named) or ""
-                else:
-                    key = (info_map()
-                           or (mapnames.to_key(shown) if shown else "") or "")
-                self._lobby_sids = {sid for _, sid in humans if sid}
-            elif stale_lobby:
-                # The lobby-info record is as stale as the seats: no map.
-                self._lobby_sids = set()
-                key = None
-            else:
-                self._lobby_sids = set()
-                key = (info_map()
-                       or (mapnames.to_key(shown) if shown else map_key))
+            self._lobby_sids = ({sid for _, sid in humans if sid}
+                                if state == STATE_LOBBY else set())
+
+            # The reading, kept for the watcher between passes, which re-reads
+            # only the map signals. Sent when it differs from what the server
+            # last answered; see _post_reading.
+            self._reading = {
+                "state": state, "stale": stale_lobby, "seats": raw_seats,
+                "ai": ai, "records": [] if stale_lobby else records,
+                "named": "" if stale_lobby else named,
+                "info": [] if stale_lobby else info_names_seen(),
+                "listed": map_key or "",
+            }
+            if DEV_TRACE:
+                print("lobby: %d human(s) %r, %d ai %r, %d record window(s), line %r"
+                      % (len(humans), [n for n, _ in humans], len(ai), ai,
+                         len(self._reading["records"]), named))
+            self._post_reading()
 
             # A lobby the game may refuse to start from (a gap in an
-            # alliance's seats). Reported only once it has survived several
-            # readings; see FAULT_READINGS.
-            faults = seat_faults(seats) if seats else []
+            # alliance's seats), as the server's last answer named it.
+            # Reported only once it has survived several readings; see
+            # FAULT_READINGS. Counted per pass, not per answer, since an
+            # unchanged lobby is not re-sent.
+            faults = [] if stale_lobby else list(self._faults_seen)
             if faults and faults == self._last_faults:
                 self._fault_runs += 1
             else:
@@ -1608,110 +1648,111 @@ class Poller(threading.Thread):
             self._last_faults = faults
             self.out.put(("fault", faults if self._fault_runs >= FAULT_READINGS
                           else []))
-
-            # The host, for the start report. The browser records are keyed
-            # by the host's SteamID64; exactly one match in the room names the
-            # host, two is unanswerable. The seat array (seat index 0) is
-            # preferred: it is there for every lobby, where the records only
-            # cover players who came in through the browser. Disagreement is
-            # logged, not decided.
-            sids = {sid for _, sid in humans if sid}
-            owners = [sid for sid in hosts if sid in sids]
-            scan_host = str(owners[0]) if len(owners) == 1 else ""
-            host = seat_host or scan_host
-            if DEV_TRACE and scan_host and seat_host and scan_host != seat_host:
-                print("host: seat 0 says %s, browser record says %s"
-                      % (seat_host, scan_host))
-            # What the report carries per player: name and SteamID (the pair
-            # cannot be recovered later, once the lobby is gone), and where
-            # they sat, which is what lets a battle with no replay say which
-            # side won. Team and slot are sent one-based so a missing value
-            # is 0, matching the replay's own numbering.
-            def seat_place(name):
-                """The seat fields for one player's report entry, or {}."""
-                tp = lobby_seats.get(name)
-                if not tp:
-                    return {}
-                t, ps = tp
-                out = {"team": t + 1, "slot": ps + 1}
-                # The byte these were decoded from and the seat's index, so a
-                # wrong split can be worked out from the archive against
-                # replays rather than needing the bug reproduced.
-                raw = seat_raw.get(name)
-                if raw:
-                    out["seat_raw"], out["seat_index"] = raw[0], raw[1]
-                # The army, under its own name, so an unconfirmed reading can
-                # be dropped later without disturbing the rest.
-                army = seat_army.get(name)
-                if army:
-                    out["army"] = army
-                return out
-
-            players = [dict({"name": n, "steam_id": str(sid) if sid else ""},
-                            **seat_place(n)) for n, sid in humans]
-            # The CPUs too, marked as such, so a battle against three of them
-            # is not reported as a battle with one player. The server keeps
-            # them out of the battle key (see battleKey).
-            players += [dict({"name": n, "steam_id": "", "is_ai": True},
-                             **seat_place(n)) for n in ai]
-            if DEV_TRACE:
-                # The roster as it will be sent.
-                print("lobby: %d human(s) %r, %d ai %r, places %r"
-                      % (len(humans), [n for n, _ in humans], len(ai), ai,
-                         lobby_seats))
-            # Kept from the last real lobby while stale: the loading screen
-            # into a battle reads as stale, and the start is built from this.
-            if not stale_lobby:
-                self._lobby_snapshot = {
-                    "map": key or "",
-                    "host": host,
-                    "host_name": next((n for n, sid in humans
-                                       if str(sid) == host), ""),
-                    "players": players,
-                }
-            if key != self._last_map:
-                self._last_map = key
-                self.out.put(("map", key))
-
-            try:
-                # Only ask the server when the roster changes: ratings move
-                # only when a replay is uploaded.
-                key = tuple(sorted(n for n, _ in humans)) + tuple(sorted(ai))
-                if key == getattr(self, "_last_key", None):
-                    # Same roster, but people swap sides and places without
-                    # anyone joining, so the seats go to the panel on their
-                    # own, without a request.
-                    if lobby_seats != getattr(self, "_last_seats", None):
-                        self._last_seats = dict(lobby_seats)
-                        self.out.put(("seats", {"seats": lobby_seats,
-                                                "me": self.local or ""}))
-                    self._wait_watching_map()
-                    continue
-                self._last_key = key
-                self._last_seats = dict(lobby_seats)
-
-                if humans:
-                    # GET the standings of the players present: name and
-                    # Steam ID per seat, in step, so badges follow the account
-                    # whatever it is called today. See getRankings on the
-                    # server.
-                    q = "&".join("player=" + urllib.parse.quote(n)
-                                 + "&steam_id=" + urllib.parse.quote(str(s or ""))
-                                 for n, s in humans)
-                    data = self._fetch(f"{self.server}/v1/rankings?{q}")
-                    data["scope"] = "lobby"
-                else:
-                    data = self._fetch(f"{self.server}/v1/rankings")
-                    data["scope"] = "global"
-                # AI seats are shown but carry no rating.
-                data["ai"] = ai
-                data["seats"] = lobby_seats
-                # The viewer, so the panel can mark their own deployment box.
-                data["me"] = self.local or ""
-                self.out.put(("ok", data))
-            except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
-                self.out.put(("error", str(e)))
             self._wait_watching_map()
+
+    def _lobby_payload(self, reading):
+        """The body for POST /v1/lobby from a reading: bytes as base64.
+
+        One copy of each record window: the same browser record sits in
+        several regions. Capped, because this is self-reported bulk and the
+        server caps it too.
+        """
+        seats = [{"index": i, "steam_id": str(sid), "name": n, "army": a,
+                  "raw": base64.b64encode(bytes(raw)).decode("ascii")}
+                 for i, sid, n, a, raw in reading["seats"]]
+        windows = sorted({bytes(w) for w in reading["records"]})[:400]
+        return {
+            "me": self.local or "",
+            "in_lobby": reading["state"] == STATE_LOBBY,
+            "seats": seats,
+            "ai": list(reading["ai"]),
+            "records": [base64.b64encode(w).decode("ascii") for w in windows],
+            "shown": reading["named"],
+            "info": list(reading["info"])[:64],
+            "listed_key": reading["listed"],
+        }
+
+    def _post_reading(self):
+        """Send the current reading when it has changed since the server last
+        answered one, and apply the answer. Failures go to the panel as an
+        error and the reading is tried again next time."""
+        reading = self._reading
+        if reading is None:
+            return
+        payload = self._lobby_payload(reading)
+        fp = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        if fp == self._lobby_sent:
+            return
+        try:
+            doc = post_lobby(self.server, payload, me=self.local)
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+            self.out.put(("error", str(e)))
+            return
+        self._lobby_sent = fp
+        self._apply_lobby_doc(doc, reading)
+
+    def _apply_lobby_doc(self, doc, reading):
+        """What the server made of a reading: the panel's standings and
+        seats, the map, the faults, the seating log and the start snapshot."""
+        stale = reading["stale"]
+        report = doc.get("report") or {}
+        players = report.get("players") or []
+        seats = {str(n): tuple(v) for n, v in (doc.get("seats") or {}).items()
+                 if isinstance(v, (list, tuple)) and len(v) == 2}
+        raw_of = {p.get("name"): (p.get("seat_raw"), p.get("seat_index"))
+                  for p in players if not p.get("is_ai")}
+        key = None if stale else (doc.get("map") or "")
+        try:
+            self._lobby_host = int(doc["host"]) if doc.get("host") else None
+        except (TypeError, ValueError):
+            self._lobby_host = None
+        self._faults_seen = [f for f in (doc.get("faults") or []) if isinstance(f, int)]
+
+        # One line per CHANGE of seating, in every build: the record of
+        # what the panel showed and when. On 1 November 2026 a player
+        # was shown in seat 1 and deployed in seat 2, and the release
+        # log held nothing to say when, or whether, the seats had
+        # moved. The raw byte and the (one-based) array index go with each
+        # seat so a wrong decode can be seen without reproducing the lobby.
+        arrangement = tuple(sorted(
+            (n, t, ps, raw_of.get(n, (None, None))) for n, (t, ps) in seats.items()))
+        if not stale and arrangement != getattr(self, "_seats_logged", None):
+            self._seats_logged = arrangement
+            print("seats: " + ", ".join(
+                "%s a%d s%d raw=%s i=%s" % (n, t + 1, ps + 1, r[0], r[1])
+                for n, t, ps, r in arrangement) if arrangement else "seats: none read")
+            # The same change, kept for the start report, so the server
+            # holds how the lobby got to its final seating and not only
+            # the final seating. Bounded: a long lobby session is a few
+            # dozen changes.
+            self._seat_log.append({
+                "t": time.time(),
+                "seats": [{"name": n, "team": t + 1, "slot": ps + 1,
+                           "raw": r[0], "index": r[1]}
+                          for n, t, ps, r in arrangement]})
+            del self._seat_log[:-20]      # the start body is read to 32 KB
+        # Kept from the last real lobby while stale: the loading screen
+        # into a battle reads as stale, and the start is built from this.
+        # The players are as the server decoded them: name and SteamID,
+        # one-based team and slot, the byte and index behind them, army.
+        if not stale:
+            self._lobby_snapshot = {
+                "map": key or "",
+                "host": report.get("host") or "",
+                "host_name": report.get("host_name") or "",
+                "players": players,
+            }
+        if key != self._last_map:
+            self._last_map = key
+            # In every build: which map the server named and from which
+            # signal, so a blank map label can be traced from the log.
+            print("map: %s (%s%s)" % (key or "none", doc.get("map_from") or "no signal",
+                                       (", shown " + repr(doc["map_shown"]))
+                                       if doc.get("map_shown") else ""))
+            self.out.put(("map", key))
+        data = dict(doc)
+        data.pop("report", None)
+        self.out.put(("ok", data))
 
     def _report_start(self):
         """POST /v1/gameStart: a battle began, from the last lobby reading.
@@ -1736,6 +1777,12 @@ class Poller(threading.Thread):
                   "against the CPU (reported when the server is local)")
             return
         self._lobby_snapshot = None
+        # How the lobby's seating got here, as seconds before this report.
+        # Cleared for the next lobby.
+        now = time.time()
+        snap["seat_log"] = [{"t": round(now - e["t"], 1), "seats": e["seats"]}
+                            for e in self._seat_log]
+        self._seat_log = []
         # Held for the ending, which must name the same battle.
         self._battle = snap
         # So a postbattle file can be told to be this battle's.
@@ -1905,12 +1952,14 @@ class Poller(threading.Thread):
                                       f"{type(e).__name__}: {e}"))
 
     def _wait_watching_map(self):
-        """Sleep out the poll interval, re-reading the map cheaply every MAP_RECHECK_SECONDS.
+        """Sleep out the poll interval, re-reading the map signals cheaply every MAP_RECHECK_SECONDS.
 
-        Re-reads only the regions that held the map last time, so a map that
-        appears or changes just after a full pass shows in about a second.
-        Reports only a map not already reported, and never clears one:
-        silence means the regions moved, and the next full pass re-finds them.
+        Re-reads only the drawn map line and the regions that held the browser
+        records last time, so a map that appears or changes just after a full
+        pass shows in about a second. A changed signal is sent to the server
+        (the reading's fingerprint decides), which answers with the map.
+        Never clears one: silence means the regions moved, and the next full
+        pass re-finds them.
         """
         deadline = time.monotonic() + self.interval
         while not self._stop.is_set() and time.monotonic() < deadline:
@@ -1918,24 +1967,44 @@ class Poller(threading.Thread):
             self._stop.wait(min(MAP_RECHECK_SECONDS, max(remaining, 0)))
             if self._stop.is_set():
                 return
-            if getattr(self, "_stale_lobby", False):
-                # Out of the lobby: these records are the last lobby's.
+            reading = self._reading
+            if reading is None or reading["stale"]:
+                # Out of the lobby: these records are the last lobby's. The
+                # next lobby gets a prompt walk for its host's record.
+                self._host_scan_at, self._host_scan_gap = 0.0, 0.0
                 continue
             try:
                 self._sample_map()
-                named = self._status_map
-                key = (mapnames.to_key(named) if named else "") or ""
-                # Never read_map's counting guess, only the record of the host
-                # sitting in our lobby, as the full pass does.
-                if not key:
-                    _guess, hosts = read_map()
-                    shown = pick_lobby_map(hosts, getattr(self, "_lobby_sids", set()))
-                    key = info_map() or (mapnames.to_key(shown) if shown else "") or ""
+                # getattr: the attribute is only created by a map line being
+                # read or a non-lobby screen being seen, so a client started
+                # inside a lobby had none, and reading it raised into the
+                # except below on every tick, silently, for the whole lobby.
+                named = getattr(self, "_status_map", "")
+                changed = named != reading["named"]
+                reading["named"] = named
+                if not self._last_map:
+                    # No map yet: the cheap regions first, and when those
+                    # are not known, which is the case when the client
+                    # started with the lobby already up, walk for them, then
+                    # leave it a while.
+                    _guess, records = read_map()
+                    if (not records
+                            and time.monotonic() >= getattr(self, "_host_scan_at", 0.0)):
+                        gap = min(max(getattr(self, "_host_scan_gap", 0.0) * 2,
+                                      HOST_SCAN_SECONDS), HOST_SCAN_MAX_SECONDS)
+                        self._host_scan_gap = gap
+                        self._host_scan_at = time.monotonic() + gap
+                        records = scan_records()
+                    if records:
+                        fresh = {bytes(w) for w in records}
+                        if fresh != {bytes(w) for w in reading["records"]}:
+                            reading["records"] = list(fresh)
+                            changed = True
+                        reading["info"] = info_names_seen()
+                if changed:
+                    self._post_reading()
             except Exception:
                 continue
-            if key and key != self._last_map:
-                self._last_map = key
-                self.out.put(("map", key))
 
 
 class Overlay:
@@ -2002,6 +2071,10 @@ class Overlay:
         # When the panel has announced it is about to collapse and has not
         # yet. Drives the footer only.
         self._hiding_at = None
+        # What the launcher is doing before the game is up ("Steam is
+        # starting..."), shown in the footer instead of "no live game" while
+        # the launch is still in hand. Empty once the game has been started.
+        self.launch_note = ""
         # The save-widget count while the battle was running, so a rise above
         # it is the results screen. None until sampled.
         self._save_base = None
@@ -2082,7 +2155,7 @@ class Overlay:
             self.poller = Poller(self.server, self.queue,
                                  save_battle_results=save_battle_results)
             self.poller.start()
-            self.mapwatch = MapWatcher(self.queue)
+            self.mapwatch = MapWatcher(self.queue, server=self.server)
             self.mapwatch.start()
             self.root.after(200, self._drain)
         self.root.after(PANEL_CHECK_MS, self._hold_on_top)
@@ -2439,6 +2512,11 @@ class Overlay:
         """Game-presence check for --no-auto-hide: the footer only, no collapse or exit."""
         self._set_game_running(game_is_running())
         self.root.after(int(GAME_CHECK_SECONDS * 1000), self._poll_game_presence)
+
+    def set_launch_note(self, text):
+        """Footer line from the launcher (Tk thread), empty when the launch is over."""
+        self.launch_note = text or ""
+        self.draw()
 
     def _set_game_running(self, present):
         """Record whether the game is running, redrawing only on a change."""
@@ -2861,7 +2939,7 @@ class Overlay:
                     self.me = payload.get("me") or self.me
                     self._seat_players(payload.get("players", []),
                                        payload.get("seats") or {})
-                    self.ai = payload.get("ai", [])
+                    self.ai = payload.get("ai") or []
                     self.scope = payload.get("scope", "global")
                     self.status = "connected"
                     self.last_ok = time.time()
@@ -3044,7 +3122,8 @@ class Overlay:
             wins, losses = p.get("wins", 0), p.get("losses", 0)
             draws = p.get("draws", 0)
 
-            # The seat number, where this player deploys. Only when read.
+            # The seat number, where this player deploys, as the server read
+            # it. Only when read.
             nx = left
             seat = self.seats.get(str(p.get("name")))
             if seat is not None:
@@ -3177,6 +3256,12 @@ class Overlay:
             c.create_text(w // 2, h - int(13 * s),
                           text=f"GAME STARTED - minimising to ★ in {left}s",
                           fill=WIN, font=self.f_small)
+            return
+        if self.launch_note and not self.game_running:
+            # Launching: the footer is the one place this is reported, so
+            # the wait for Steam is never a silent pause.
+            c.create_text(w // 2, h - int(13 * s), text=self.launch_note.upper(),
+                          fill=DIM, font=self.f_small)
             return
         if self.game_running is False:
             # No game outranks every other status; the one useful thing left

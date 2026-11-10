@@ -38,8 +38,10 @@ import steamauth  # noqa: E402
 #: had checked; 3 added battle reports read from game memory and the game-file
 #: repairs; 4 added the Napoleon.exe repair and the public red-coat badge; 5
 #: withdrew the on-disk exe edit, disclosed the in-memory artillery fix and
-#: made the repairs required; 6 added the one-click self-update.
-TERMS_TEXT = "6"
+#: made the repairs required; 6 added the one-click self-update; 7 disclosed
+#: that the lobby's seat list and browser entries are sent as read from the
+#: game's memory, for the server to interpret (0.8.4).
+TERMS_TEXT = "7"
 
 #: What is stored and sent. Includes the client version, so a new build asks
 #: again; see the module docstring.
@@ -108,6 +110,12 @@ WHAT IS SENT TO THE SERVER
   * The version of this client, sent with every request.
   * Each time the client starts: which of the crash repairs
     described above are in place on your install.
+  * While you are in a lobby: the lobby's seat list and the lobby
+    browser's entries, copied as they sit in the game's memory (a
+    few kilobytes), so the server can work out who sits where and
+    which map was chosen. They carry the names and Steam IDs of the
+    players in the lobby and of the hosts on the browser list, and
+    nothing of yours beyond that.
   * The network address your connection comes from. It is stored
     with your agreement to these terms, as described in clause 7,
     and with any desync log you send.

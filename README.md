@@ -85,10 +85,19 @@ module named.
 
 Redcoatz finds the `Napoleon.exe` process and opens it with read-only
 rights (`PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`). It reads the lobby's
-seat list (names, Steam IDs, alliances), the map line, which screen the game
-is showing, and the end-of-battle results table. It never writes to the game's
-memory through these readers. Modules: `lobby_memory.py`, `roster.py`,
-`live_seats.py`, `results.py`, `ladder_overlay.py`.
+seat list (names, Steam IDs, the raw seat records), the lobby browser's
+entries, the map line, which screen the game is showing, and the end-of-battle
+results table. It never writes to the game's memory through these readers.
+Modules: `lobby_memory.py`, `roster.py`, `live_seats.py`, `results.py`,
+`ladder_overlay.py`.
+
+Since 0.8.4 the client does not interpret the seat records or the browser
+entries. It cuts the bytes and sends them to the ladder server (`POST
+/v1/lobby`), which decodes which alliance and deployment box each seat is in
+and which map the host chose, in whatever language the host's game runs. The
+client finds the bytes; the server says what they mean. That keeps the
+decoding adjustable without a new client build, and the only thing to audit
+here is what is sent, which the table below lists.
 
 There is one deliberate exception. `artilleryfix.py` patches a crash in large
 battles: the game scans up to 100 targets for a gun and writes past the end
@@ -154,14 +163,15 @@ the program version in its User-Agent.
 | Sent | Endpoint | Module |
 |---|---|---|
 | Replay file, your name and Steam ID | `POST /v1/replays` | `uploader.py` |
-| Lobby snapshot when a battle starts: map, host, each seat's name, Steam ID, alliance and army | `POST /v1/gameStart` | `ladder_overlay.py` |
+| Lobby snapshot when a battle starts: map, host, each seat's name, Steam ID, alliance, box and army, as the server decoded them from the reading below | `POST /v1/gameStart` | `ladder_overlay.py` |
 | End-of-battle report: the same snapshot plus how it ended, the game's verdict and results table | `POST /v1/gameStart` with a `kind` | `ladder_overlay.py` |
 | Notice that the game closed | `POST /v1/gameClosed` | `ladder_overlay.py` |
 | Desync log | `POST /v1/desyncs` | `desync.py` |
 | Steam ID and terms version accepted | `POST /v1/consent` | `consent.py` |
 | Which of the three fixes are applied | `POST /v1/clientStatus` | `clientstatus.py` |
 | Steam sign-in: the browser is sent to `/auth/steam`, Steam redirects back to a listener on `127.0.0.1` with a key | `/auth/steam`, `/v1/whoami`, `/v1/signout` | `steamauth.py` |
-| The lobby's names and Steam IDs, to fetch their ratings | `GET /v1/rankings` | `ladder_overlay.py` |
+| The lobby as read: each seat record's 96 bytes with the name and army its pointers led to, the bytes around each lobby-browser entry (about 1.3 KB each), the map line the lobby draws and the Info line's map names. Sent when it changes. The server decodes who sits where and which map it is, and answers with the ratings the panel shows | `POST /v1/lobby` | `ladder_overlay.py` |
+| The global ladder, before the first lobby reading | `GET /v1/rankings` | `ladder_overlay.py` |
 | Fetched: map pictures, version check, ban check, updates | `GET /v1/maps/...`, `/v1/client`, `/v1/banned`, `/client-version.json`, `/Redcoatz.exe` | `ladder_overlay.py`, `update.py`, `selfupdate.py` |
 
 Updates are never automatic. When a newer version exists the panel offers it;
@@ -180,7 +190,7 @@ in and restarted (`selfupdate.py`).
 | `steamauth.py`, `consent.py`, `update.py`, `selfupdate.py` | Sign-in, terms, version checks, updating |
 | `fix23e.py`, `fixmiles.py`, `artilleryfix.py`, `fixbuffer.py` | The crash repairs |
 | `postbattle_hook.py`, `gamefiles/button_rematch.luac` | The post-battle Lua hook |
-| `gamelaunch.py`, `gameprefs.py`, `lobby.py`, `mapnames.py` | Finding the game, its settings, its chat files, map names |
+| `gamelaunch.py`, `gameprefs.py`, `lobby.py` | Finding the game, its settings, its chat files |
 | `nettrust.py`, `singleton.py`, `clientstatus.py`, `version.py` | Small utilities |
 | `build.py` | Builds the exe |
 

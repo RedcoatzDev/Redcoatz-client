@@ -32,6 +32,17 @@ Undo: --restore copies the backup back, or copy it over the pack by hand.
 The NTW3 launcher updates its own packs, so a mod release overwrites the
 repair and the client offers it again.
 
+NTW3 9.6.1 (November 2026, an unofficial pack rewrite posted on the Lordz
+Discord) puts the four missing textures on the French atlas sheet, so its
+variants94b.pack carries the flag bearers in their STOCK form on purpose: with
+the textures present there is nothing to repair, and that installer undoes
+our edit where it finds it. Its pack is recognised here by size (NTW3_961_SIZE,
+hash NTW3_961_SHA) and reported as SUPERSEDED, a state the client and the
+ladder both treat as fixed. Without this, status() would read those stock
+entries as STOCK, the client would insist on the repair, apply() would refuse
+the unknown pack, and the player would be shut out of Redcoatz for having
+installed a fix.
+
 Which entries are repaired is decided by content, not by name: 24 entries in
 the pack are the same 11,426-byte flag-bearer file under different names, and
 only the six whose soldier variant does not itself reference the missing
@@ -75,7 +86,17 @@ FIXES = (
      _P + "belts/Belts/Belt_2/texture"),
 )
 
+# The NTW3 9.6.1 variants94b.pack (see the module docstring). Size is the
+# cheap test status() runs every launch; the hash is for --status and tests.
+# Both are from the 9.6.1 installer's own manifest (output of variants94b).
+NTW3_961_SIZE = 422327801
+NTW3_961_SHA = "f03c8e96e7780a8491c65479515397f838dbc727f9c9fd59fa8441425d1fdb42"
+
 STOCK, FIXED, UNKNOWN, MISSING = "stock", "fixed", "unknown", "missing"
+#: The 23e textures are present in the pack itself, so no repair is needed
+#: or possible. Not "fixed": nothing of ours is in the file. The server's
+#: protected rule only rejects "stock" and "unknown", so this word passes.
+SUPERSEDED = "superseded"
 
 
 def locate():
@@ -180,6 +201,11 @@ def status(path=None):
     path = path or locate()
     if not path or not os.path.isfile(path):
         return {"state": MISSING, "path": path, "detail": "pack not found"}
+    if os.path.getsize(path) == NTW3_961_SIZE:
+        return {"state": SUPERSEDED, "path": path, "old": 0, "new": 0,
+                "names": [],
+                "detail": "NTW3 9.6.1 pack: the flag bearers' textures are "
+                          "present, nothing to repair"}
     try:
         with open(path, "rb") as f:
             sel = _selected(f)
@@ -422,8 +448,12 @@ def main():
     st = status(args.pack)
     print(f"  pack : {st['path']}")
     print(f"  state: {st['state']}  ({st['detail']})")
-    if st["state"] in (STOCK, FIXED) and st["path"]:
-        print(f"  sha256: {_sha(st['path'])}")
+    if st["state"] in (STOCK, FIXED, SUPERSEDED) and st["path"]:
+        digest = _sha(st['path'])
+        print(f"  sha256: {digest}")
+        if st["state"] == SUPERSEDED:
+            print("  9.6.1 hash " + ("matches" if digest == NTW3_961_SHA
+                                     else "does NOT match: " + NTW3_961_SHA))
 
     if args.apply:
         ok, msg = apply(args.pack)
