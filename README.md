@@ -174,6 +174,8 @@ the program version in its User-Agent.
 | The lobby as read: each seat record's 96 bytes with the name and army its pointers led to, the bytes around each lobby-browser entry (about 1.3 KB each), the map line the lobby draws and the Info line's map names. Sent when it changes. The server decodes who sits where and which map it is, and answers with the ratings the panel shows | `POST /v1/lobby` | `ladder_overlay.py` |
 | The global ladder, before the first lobby reading | `GET /v1/rankings` | `ladder_overlay.py` |
 | Fetched: map pictures, version check, ban check | `GET /v1/maps/...`, `/v1/client`, `/v1/banned` | `ladder_overlay.py`, `update.py` |
+| Fetched for the NTW3 installer, when you open it: the install list with every file's size and checksums | `raw.githubusercontent.com/RedcoatzDev/Redcoatz-client/main/install_manifest.json` | `ntw3setup.py`, `setup_screen.py` |
+| Downloaded and run by the NTW3 installer, only after you click Install and agree: the official NTW3 9.4, 9.5 and 9.6 installers and the 9.6.1 tool, each checked against the list above first | the `base` address in `install_manifest.json` (a Cloudflare R2 bucket) | `ntw3setup.py` |
 | Fetched from GitHub, only after you agree: the latest release of this repository and its `Redcoatz.exe` | `api.github.com/repos/RedcoatzDev/Redcoatz-client/releases/latest`, the release's download | `selfupdate.py` |
 
 Updates are never automatic. When a newer version exists the panel offers it;

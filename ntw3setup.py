@@ -223,6 +223,29 @@ def detect(manifest, game, check_crc=True):
     return out
 
 
+#: One file from each step, for a look at start-up that needs no install
+#: list and no network. Presence only: the setup screen does the real check.
+MARKERS = (
+    "data/NTW3/Version94/Maps/maps_custom.pack",
+    "data/NTW3/Version94/Data/txt.9401.pack",
+    "data/NTW3/Version95/Maps/maps_defs.9501.pack",
+    "data/NTW3/Version95/Data/db.9501.pack",
+    "data/NTW3/Version96/Maps/maps_defs.9601.pack",
+    "data/NTW3/Version96/Data/db.9601.pack",
+    "data/NTW3/Launcher/NTW3 v9.6.exe",
+)
+
+
+def missing_markers(game=None):
+    """The MARKERS this install lacks. [] when all are there, and also when
+    the game itself cannot be found, which is the caller's other question."""
+    if game is None:
+        _state, game = napoleon()
+    if not game:
+        return []
+    return [m for m in MARKERS if not os.path.isfile(os.path.join(game, *m.split("/")))]
+
+
 def todo(states, chosen=None):
     """The steps to run, in order: every one not installed, or only the chosen
     ids for a custom install. A chosen step that needs an earlier, unchosen
@@ -422,11 +445,81 @@ def command_line(step, exe, game, log):
     return f'"{exe}" {args}'
 
 
+#: Windows' "the requested operation requires elevation".
+ELEVATION_REQUIRED = 740
+
+
+class _Elevated:
+    """A program started through Windows' own "run as administrator"
+    question, with the one method run() needs. Some of the official files ask
+    for administrator rights, and an ordinary start of those is refused."""
+
+    def __init__(self, exe, args, cwd):
+        import ctypes
+        from ctypes import wintypes
+
+        class SHELLEXECUTEINFOW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+                        ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                        ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                        ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                        ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                        ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                        ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                        ("hProcess", wintypes.HANDLE)]
+
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self._k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        self._k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._dword = wintypes.DWORD
+        self._byref = ctypes.byref
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = 0x40                     # SEE_MASK_NOCLOSEPROCESS
+        info.lpVerb = "runas"
+        info.lpFile = exe
+        info.lpParameters = args
+        info.lpDirectory = cwd
+        info.nShow = 1
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+        if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+            err = ctypes.get_last_error()
+            if err == 1223:                   # the player said no to the question
+                raise SetupError("Windows asked for administrator rights to run %s and the "
+                                 "answer was no. Nothing was changed. Click Install to try "
+                                 "again." % os.path.basename(exe))
+            raise SetupError("Windows would not start %s as administrator (error %s)."
+                             % (os.path.basename(exe), err))
+        self._h = info.hProcess
+        self._code = None
+
+    def poll(self):
+        if self._code is None and self._k32.WaitForSingleObject(self._h, 0) == 0:
+            code = self._dword()
+            self._k32.GetExitCodeProcess(self._h, self._byref(code))
+            self._code = code.value
+            self._k32.CloseHandle(self._h)
+        return self._code
+
+
+def start(step, exe, game, log, popen=subprocess.Popen):
+    """Start a step's program: plainly, and through Windows' administrator
+    question when Windows says the program needs that."""
+    try:
+        return popen(command_line(step, exe, game, log), cwd=os.path.dirname(exe))
+    except OSError as e:
+        if getattr(e, "winerror", None) != ELEVATION_REQUIRED:
+            raise
+    args = step["run"]["args"].replace("{game}", game.rstrip("\\/")).replace("{log}", log)
+    return _Elevated(exe, args, os.path.dirname(exe))
+
+
 def run(step, exe, game, log, popen=subprocess.Popen, progress=None, poll=1.0):
     """Run one official file and wait. Raises SetupError on a refusal or a
     failure. progress(done, total) follows bytes landing in the game folder,
     since neither installer reports its own."""
-    cmd = command_line(step, exe, game, log)
     targets = {os.path.join(game, *f["path"].split("/")): f["bytes"] for f in step.get("files", [])}
     total = step.get("unpacked_bytes", 0)
 
@@ -446,7 +539,7 @@ def run(step, exe, game, log, popen=subprocess.Popen, progress=None, poll=1.0):
         # Said once up front, so a step that reports nothing (the 9.6.1
         # tool writes in place) still shows that it is running.
         progress(0, total)
-    proc = popen(cmd, cwd=os.path.dirname(exe))
+    proc = start(step, exe, game, log, popen=popen)
     while True:
         code = proc.poll()
         if code is not None:

@@ -41,8 +41,9 @@ import steamauth  # noqa: E402
 #: made the repairs required; 6 added the one-click self-update; 7 disclosed
 #: that the lobby's seat list and browser entries are sent as read from the
 #: game's memory, for the server to interpret (0.8.4); 8 moved updates to
-#: GitHub releases only, with a question before each one.
-TERMS_TEXT = "8"
+#: GitHub releases only, with a question before each one; 9 added the NTW3
+#: installer and that battle reports say who left.
+TERMS_TEXT = "9"
 
 #: What is stored and sent. Includes the client version, so a new build asks
 #: again; see the module docstring.
@@ -94,6 +95,15 @@ WHAT THIS PROGRAM DOES
     The client checks the download against GitHub's checksum,
     replaces itself with it in the same folder, and restarts. It
     never updates on its own, and saying no changes nothing.
+  * It can install NTW3 for you, from "Install or repair NTW3" in
+    its menu, or offered at start when no NTW3 is found. It shows
+    what is missing and does nothing until you click Install and
+    agree to a list of every file, its size and where it comes
+    from. It then downloads the official NTW3 installers (9.4,
+    9.5, 9.6 and the 9.6.1 tool) from the Redcoatz file store,
+    checks each against the checksum published in the public
+    GitHub repository, and runs them on your Napoleon: Total War
+    folder. You can always install those files yourself instead.
   * If a battle desynchronises, the game itself writes a log naming
     who lost sync. The client sends that log, so the ladder has a
     record of battles that collapsed. The game writes this file

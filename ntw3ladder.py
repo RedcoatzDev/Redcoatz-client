@@ -721,12 +721,46 @@ def main():
     root.deiconify()
     step("panel is up; running")
 
+    # No NTW3, or one with a part missing: offer the installer instead of a
+    # launch that cannot work, or that would start an older NTW3. It only
+    # shows what is missing; nothing is downloaded until the player clicks
+    # Install and agrees. Redcoatz is started again afterwards, so its crash
+    # fixes are checked against the new files.
+    needs_setup = False
+    if not args.demo and not args.no_game and not args.game_path:
+        try:
+            import ntw3setup
+            lacking = ntw3setup.missing_markers()
+            if gamelaunch.find_launcher() is None:
+                step("no NTW3 launcher found; opening the setup screen")
+                needs_setup = True
+            elif lacking:
+                step(f"NTW3 is incomplete ({len(lacking)} files missing, first "
+                     f"{lacking[0]}); opening the setup screen, not starting the game")
+                needs_setup = True
+        except Exception as e:                # noqa: BLE001 - never fatal
+            step(f"setup check failed, continuing without it: {e!r}")
+        if needs_setup:
+            def carry_on():
+                # Everything is installed: start again, so the crash fixes
+                # are checked against the new files and the game is started
+                # the usual way.
+                step("NTW3 installed; restarting Redcoatz to start the game")
+                if selfupdate.restart_self(log=step):
+                    root.after(0, root.destroy)
+                else:
+                    panel.set_launch_note("NTW3 is installed: restart Redcoatz to play")
+            panel.setup_done = carry_on
+            root.after(600, panel.open_setup)
+            root.after(700, panel.set_launch_note,
+                       "NTW3 is not complete: use the installer")
+
     # Start the game last, once the terms are settled and the first upload is
     # done, so the launcher does not cover the windows the player must answer.
     # On its own thread: the wait for Steam can run a minute, and the panel
     # has to keep drawing through it. Progress goes to the footer via the Tk
     # thread.
-    if not args.demo and not args.no_game:
+    if not args.demo and not args.no_game and not needs_setup:
         def note(text):
             root.after(0, panel.set_launch_note, text)
 
