@@ -4,16 +4,27 @@ Nothing here runs unless the player clicks update (or passes --self-update).
 It works only from the built exe; run from source there is nothing to
 replace, and the caller falls back to opening the website.
 
+Where updates come from: the public GitHub repository
+https://github.com/RedcoatzDev/Redcoatz-client, never redcoatz.com. Each
+release there carries a Redcoatz.exe that GitHub itself built from the tagged
+source (.github/workflows/verify.yml), and GitHub publishes that file's size
+and SHA-256. So the code a player updates to is code anyone can read, built
+by a machine we do not control, and a takeover of the ladder's website,
+server or domain cannot push an update.
+
 What it does:
 
-  1. GET <site>/client-version.json for the published version, byte count
-     and SHA-256. The site is https://redcoatz.com unless the
-     REDCOATZ_UPDATE_SITE environment variable says otherwise (for testing).
-  2. GET <site>/Redcoatz.exe into "<this exe>.new" in the exe's own folder,
-     hashing as it arrives.
-  3. Verify the size and SHA-256 against the published values. A file that
-     does not match is deleted and nothing else happens. The download is
-     never run before this check passes.
+  1. GET the latest release of that repository from GitHub's API: its
+     version, and the Redcoatz.exe attached to it with GitHub's size and
+     SHA-256. An exe that was not uploaded by GitHub's own build
+     (github-actions[bot]), or that comes without GitHub's checksum, is
+     refused: that would be a file attached by hand.
+  2. Ask the player, naming the repository and the version. Nothing is
+     downloaded until they say yes. Then GET that Redcoatz.exe into
+     "<this exe>.new" in the exe's own folder, hashing as it arrives.
+  3. Verify the size and SHA-256 against GitHub's. A file that does not
+     match is deleted and nothing else happens. The download is never run
+     before this check passes.
   4. Windows will not let a running program be overwritten, but it can be
      renamed: this exe becomes "<stem>.old.exe" and the new file takes this
      exe's name. Any failure renames the original back.
@@ -24,8 +35,9 @@ What it does:
 
 Same folder and same file name, so shortcuts keep working. The download goes
 beside the exe rather than into %TEMP% because some virus scanners block
-executables written there. Nothing is sent to the site but the request
-itself, with the client version as User-Agent.
+executables written there. Nothing is sent to GitHub but the requests
+themselves, with the client version as User-Agent. REDCOATZ_UPDATE_API
+replaces the GitHub API address, for testing only.
 """
 
 import hashlib
@@ -37,13 +49,18 @@ import threading
 import time
 import urllib.request
 
-from version import USER_AGENT
+from version import USER_AGENT, VERSION
 
-#: Where updates come from. REDCOATZ_UPDATE_SITE replaces it for testing; a
-#: file:/// folder holding Redcoatz.exe and client-version.json works.
-SITE = os.environ.get("REDCOATZ_UPDATE_SITE", "https://redcoatz.com").rstrip("/")
-META_URL = SITE + "/client-version.json"
-EXE_URL = SITE + "/Redcoatz.exe"
+#: The public repository updates come from, and its latest release.
+REPO = "RedcoatzDev/Redcoatz-client"
+REPO_URL = f"https://github.com/{REPO}"
+API_URL = os.environ.get("REDCOATZ_UPDATE_API",
+                         f"https://api.github.com/repos/{REPO}/releases/latest")
+#: The asset, and who must have uploaded it: GitHub's own build.
+ASSET = "Redcoatz.exe"
+BUILDER = "github-actions[bot]"
+#: Where a failed update sends the player instead.
+SITE = "https://redcoatz.com"
 
 
 def can_self_update():
@@ -65,17 +82,74 @@ def _get(url, timeout=30):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def release_meta(rel):
+    """{'version', 'bytes', 'sha256', 'url', 'page'} from a GitHub release
+    document. Raises with a reason the player can read when the release does
+    not carry an exe GitHub built and checksummed."""
+    tag = str(rel.get("tag_name") or "")
+    version = tag[1:] if tag[:1] in ("v", "V") else tag
+    if not version:
+        raise RuntimeError("the latest GitHub release has no version tag")
+    if rel.get("draft") or rel.get("prerelease"):
+        raise RuntimeError(f"v{version} on GitHub is not a full release")
+    assets = [a for a in rel.get("assets") or [] if a.get("name") == ASSET]
+    if len(assets) != 1:
+        raise RuntimeError(f"the v{version} release on GitHub has no {ASSET} yet. "
+                           "GitHub builds it a few minutes after the release is "
+                           "published, so try again shortly")
+    a = assets[0]
+    uploader = (a.get("uploader") or {}).get("login")
+    if uploader != BUILDER:
+        raise RuntimeError(f"{ASSET} on the v{version} release was not built by GitHub "
+                           f"(it was attached by {uploader or 'an unknown account'}), "
+                           "so it was not installed")
+    digest = str(a.get("digest") or "")
+    if not digest.startswith("sha256:") or len(digest) != 7 + 64:
+        raise RuntimeError(f"GitHub publishes no checksum for {ASSET} on v{version}")
+    url = str(a.get("browser_download_url") or "")
+    if (not url.startswith(f"https://github.com/{REPO}/releases/download/")
+            and not os.environ.get("REDCOATZ_UPDATE_API")):
+        raise RuntimeError("the download address is not on the Redcoatz repository")
+    return {"version": version, "bytes": int(a.get("size") or 0),
+            "sha256": digest[7:].lower(), "url": url,
+            "page": str(rel.get("html_url") or f"{REPO_URL}/releases/tag/{tag}")}
+
+
 def fetch_meta():
-    """GET client-version.json: {'version', 'bytes', 'sha256', ...} as the site publishes it."""
-    with _get(META_URL) as r:
-        return json.loads(r.read().decode("utf-8"))
+    """The latest release on GitHub, as release_meta reads it."""
+    req = urllib.request.Request(API_URL, headers={"User-Agent": USER_AGENT,
+                                                   "Accept": "application/vnd.github+json",
+                                                   "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return release_meta(json.loads(r.read().decode("utf-8")))
+
+
+def is_newer(meta):
+    """True when the release is newer than this build."""
+    def parse(v):
+        out = []
+        for part in str(v).split("."):
+            digits = "".join(c for c in part if c.isdigit())
+            out.append(int(digits) if digits else 0)
+        return tuple((out + [0, 0, 0])[:3])
+    return parse(meta["version"]) > parse(VERSION)
+
+
+def confirm_text(meta):
+    """What the player is asked before anything is downloaded."""
+    return ("This update will download Redcoatz v%s from\n%s\n"
+            "and install it on your computer, replacing this copy.\n\n"
+            "GitHub built that file from the public source code you can read "
+            "there, and Redcoatz checks it against GitHub's checksum before "
+            "running it.\n\nAre you sure you want to proceed?"
+            % (meta["version"], REPO_URL))
 
 
 def download(meta, progress=None):
     """Download the new exe to "<exe>.new" and verify it. Returns the path of the checked file.
 
-    The SHA-256 is computed as the bytes arrive and compared with the
-    published hash, and the size with the published size. On any mismatch
+    The SHA-256 is computed as the bytes arrive and compared with GitHub's,
+    and the size with GitHub's. On any mismatch
     or failure the partial file is removed and an exception is raised; the
     file is never left in place unverified. progress(done_bytes,
     total_bytes) is called as it arrives.
@@ -84,11 +158,11 @@ def download(meta, progress=None):
     want_size = int(meta.get("bytes") or 0)
     want_hash = (meta.get("sha256") or "").lower()
     if not want_hash:
-        raise RuntimeError("the site does not publish a checksum for this version")
+        raise RuntimeError("no checksum for this version")
     h = hashlib.sha256()
     done = 0
     try:
-        with _get(EXE_URL, timeout=60) as r, open(new, "wb") as f:
+        with _get(meta["url"], timeout=60) as r, open(new, "wb") as f:
             while True:
                 chunk = r.read(1 << 16)
                 if not chunk:
@@ -101,7 +175,7 @@ def download(meta, progress=None):
         if want_size and done != want_size:
             raise RuntimeError(f"download was {done} bytes, expected {want_size}")
         if h.hexdigest() != want_hash:
-            raise RuntimeError("download does not match the published checksum")
+            raise RuntimeError("the download does not match GitHub's checksum")
         return new
     except BaseException:
         try:
@@ -219,11 +293,13 @@ def cleanup(log=print):
 
 
 def run_gui(parent, on_restart, fallback=SITE, log=print):
-    """Download, verify and swap, with a small progress window over `parent`.
+    """Ask, download, verify and swap, with a small window over `parent`.
 
-    on_restart() is called once the new exe has been started; it must make
-    this process exit. On any failure the window says what went wrong and
-    offers to open the website in the browser instead.
+    Looks up the latest GitHub release first and asks the player, naming the
+    repository and the version, before anything is downloaded; "No" closes
+    the window and nothing changes. on_restart() is called once the new exe
+    has been started; it must make this process exit. On any failure the
+    window says what went wrong and offers the website instead.
     """
     import tkinter as tk
     import webbrowser
@@ -237,23 +313,35 @@ def run_gui(parent, on_restart, fallback=SITE, log=print):
     head = tk.Label(win, text="Updating Redcoatz", bg=bg, fg=gold,
                     font=("Georgia", 13, "bold"))
     head.pack(padx=30, pady=(20, 8))
-    msg = tk.Label(win, text="Checking for the latest version...", bg=bg,
+    msg = tk.Label(win, text="Checking GitHub for the latest release...", bg=bg,
                    fg=fg, font=("Georgia", 10), justify="center", wraplength=380)
     msg.pack(padx=30)
     row = tk.Frame(win, bg=bg)
     row.pack(pady=(14, 18))
 
-    state = {"text": None, "done": False, "error": None}
+    state = {"text": None, "done": False, "error": None, "meta": None,
+             "asked": False, "go": threading.Event(), "cancel": False}
 
     def work():
         try:
             meta = fetch_meta()
             ver = meta.get("version", "?")
-            state["text"] = f"Downloading v{ver}..."
+            if not is_newer(meta):
+                state["current"] = (f"This is v{VERSION}, the newest release on GitHub. "
+                                    "If the ladder says a newer version is out, GitHub is "
+                                    "still building it; try again in a few minutes.")
+                return
+            # Nothing is downloaded until the player has said yes.
+            state["meta"] = meta
+            state["go"].wait()
+            if state["cancel"]:
+                return
+            log(f"update: the player agreed to v{ver} from {meta['url']}")
+            state["text"] = f"Downloading v{ver} from GitHub..."
 
             def progress(done, total):
                 if total:
-                    state["text"] = (f"Downloading v{ver}... "
+                    state["text"] = (f"Downloading v{ver} from GitHub... "
                                      f"{done * 100 // total}%")
             new = download(meta, progress)
             state["text"] = f"Installing v{ver}..."
@@ -271,14 +359,55 @@ def run_gui(parent, on_restart, fallback=SITE, log=print):
             pass
         win.destroy()
 
+    def proceed():
+        for w in row.winfo_children():
+            w.destroy()
+        head.config(text="Updating Redcoatz")
+        msg.config(text="Starting the download...")
+        state["go"].set()
+
+    def cancel():
+        state["cancel"] = True
+        state["go"].set()
+        log("update: the player declined")
+        win.destroy()
+
+    def view():
+        try:
+            webbrowser.open_new_tab(state["meta"]["page"])
+        except Exception:                  # noqa: BLE001
+            pass
+
     def poll():
         if not win.winfo_exists():
+            state["cancel"] = True
+            state["go"].set()
             return
+        if state["meta"] and not state["asked"]:
+            state["asked"] = True
+            head.config(text="Install this update?")
+            msg.config(text=confirm_text(state["meta"]), justify="left")
+            tk.Button(row, text="Yes, install it", command=proceed, bg="#AE3238",
+                      fg="#FFFBF4", relief="flat",
+                      font=("Georgia", 10, "bold")).pack(side="left", padx=6)
+            tk.Button(row, text="View on GitHub", command=view, bg="#171C29",
+                      fg="#CBC4B2", relief="flat",
+                      font=("Georgia", 10)).pack(side="left", padx=6)
+            tk.Button(row, text="No", command=cancel, bg="#171C29",
+                      fg="#CBC4B2", relief="flat",
+                      font=("Georgia", 10)).pack(side="left", padx=6)
         if state["text"]:
             msg.config(text=state["text"])
         if state["done"]:
             msg.config(text="Restarting with the new version...")
             win.after(300, on_restart)
+            return
+        if state.get("current"):
+            head.config(text="You have the newest version")
+            msg.config(text=state["current"], fg=dim)
+            tk.Button(row, text="Close", command=win.destroy, bg="#171C29",
+                      fg="#CBC4B2", relief="flat",
+                      font=("Georgia", 10)).pack(side="left", padx=6)
             return
         if state["error"]:
             head.config(text="The update did not complete")

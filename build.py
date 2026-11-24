@@ -311,6 +311,7 @@ def main():
         "--hidden-import", "live_seats",
         "--hidden-import", "roster",
         "--hidden-import", "lobby",
+        "--hidden-import", "peers",
         # The rest are imported lazily, inside functions, so PyInstaller's
         # static analysis never sees them; left out, the feature silently does
         # nothing in the frozen exe while working from source.
@@ -381,7 +382,8 @@ def main():
                 json.dump({
                     "version": VERSION,
                     "bytes": os.path.getsize(exe),
-                    # selfupdate.py checks its download against this.
+                    # The website's download line shows this; the updater
+                    # checks against GitHub's own release (selfupdate.py).
                     "sha256": _sha256(exe),
                     # The UTC date whose midnight was SOURCE_DATE_EPOCH;
                     # build.py --verify <built> rebuilds this exact exe.

@@ -137,7 +137,17 @@ def block_gui(info, parent=None):
     if owns_root:
         win.mainloop()
     else:
-        win.transient(parent)
+        # transient() only when the parent is on screen. Tk withdraws a
+        # transient along with its master, and the root is withdrawn here,
+        # so the screen vanished the instant it was made: on 9 November 2026
+        # every 0.8.3 client refused by CLIENT_MIN_VERSION sat invisible
+        # with nothing to click. Same guard as consent.py.
+        if parent.winfo_viewable():
+            win.transient(parent)
+        else:
+            win.attributes("-topmost", True)
+            win.lift()
+            win.focus_force()
         win.grab_set()
         parent.wait_window(win)
     try:
@@ -205,7 +215,17 @@ def banned_gui(info, parent=None):
     if owns_root:
         win.mainloop()
     else:
-        win.transient(parent)
+        # transient() only when the parent is on screen. Tk withdraws a
+        # transient along with its master, and the root is withdrawn here,
+        # so the screen vanished the instant it was made: on 9 November 2026
+        # every 0.8.3 client refused by CLIENT_MIN_VERSION sat invisible
+        # with nothing to click. Same guard as consent.py.
+        if parent.winfo_viewable():
+            win.transient(parent)
+        else:
+            win.attributes("-topmost", True)
+            win.lift()
+            win.focus_force()
         win.grab_set()
         parent.wait_window(win)
     try:

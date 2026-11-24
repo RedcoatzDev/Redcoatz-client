@@ -165,6 +165,7 @@ the program version in its User-Agent.
 | Replay file, your name and Steam ID | `POST /v1/replays` | `uploader.py` |
 | Lobby snapshot when a battle starts: map, host, each seat's name, Steam ID, alliance, box and army, as the server decoded them from the reading below | `POST /v1/gameStart` | `ladder_overlay.py` |
 | End-of-battle report: the same snapshot plus how it ended, the game's verdict and results table | `POST /v1/gameStart` with a `kind` | `ladder_overlay.py` |
+| During a battle, when the game stops counting a player: the same snapshot with kind `player_left` and a `left` list (name, Steam ID, how long ago). The list rides on the later reports of that battle too | `POST /v1/gameStart` | `ladder_overlay.py`, `peers.py` |
 | Notice that the game closed | `POST /v1/gameClosed` | `ladder_overlay.py` |
 | Desync log | `POST /v1/desyncs` | `desync.py` |
 | Steam ID and terms version accepted | `POST /v1/consent` | `consent.py` |
@@ -172,7 +173,8 @@ the program version in its User-Agent.
 | Steam sign-in: the browser is sent to `/auth/steam`, Steam redirects back to a listener on `127.0.0.1` with a key | `/auth/steam`, `/v1/whoami`, `/v1/signout` | `steamauth.py` |
 | The lobby as read: each seat record's 96 bytes with the name and army its pointers led to, the bytes around each lobby-browser entry (about 1.3 KB each), the map line the lobby draws and the Info line's map names. Sent when it changes. The server decodes who sits where and which map it is, and answers with the ratings the panel shows | `POST /v1/lobby` | `ladder_overlay.py` |
 | The global ladder, before the first lobby reading | `GET /v1/rankings` | `ladder_overlay.py` |
-| Fetched: map pictures, version check, ban check, updates | `GET /v1/maps/...`, `/v1/client`, `/v1/banned`, `/client-version.json`, `/Redcoatz.exe` | `ladder_overlay.py`, `update.py`, `selfupdate.py` |
+| Fetched: map pictures, version check, ban check | `GET /v1/maps/...`, `/v1/client`, `/v1/banned` | `ladder_overlay.py`, `update.py` |
+| Fetched from GitHub, only after you agree: the latest release of this repository and its `Redcoatz.exe` | `api.github.com/repos/RedcoatzDev/Redcoatz-client/releases/latest`, the release's download | `selfupdate.py` |
 
 Updates are never automatic. When a newer version exists the panel offers it;
 on a click the new exe is downloaded next to the old one, its size and
@@ -212,11 +214,20 @@ serves. The result is under the Actions tab, with both hashes in the job
 summary. The exe on the release page depends on nothing but this source and
 GitHub's runner, so it is also a place to download from.
 
-**2. Is the file you downloaded the one the website serves?** The website
-publishes the SHA-256 of the current exe in `client-version.json`, and the
-updater built into the program refuses a download that does not match it.
-To check a file yourself, open a Command Prompt in the folder you saved it
-to and run
+**2. Where do updates come from?** Only from this repository's releases.
+When you click to update, the program asks first, naming the version and
+this repository. It then downloads the `Redcoatz.exe` attached to the
+latest release, and only if GitHub's own build uploaded it
+(`github-actions[bot]`): an exe attached to a release by hand is refused.
+The download is checked against the SHA-256 GitHub publishes for that file
+before it runs. Nothing is fetched from redcoatz.com for an update, so a
+takeover of the website or the ladder server cannot push code to your
+machine.
+
+**3. Is the file you downloaded the one the website serves?** The website
+publishes the SHA-256 of the current exe in `client-version.json`, the
+same value the GitHub release shows. To check a file yourself, open a
+Command Prompt in the folder you saved it to and run
 
     certutil -hashfile Redcoatz.exe SHA256
 
