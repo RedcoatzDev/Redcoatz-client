@@ -955,6 +955,9 @@ def _phrase_at(d, i, limit=24):
 #: process, where a map's display name or preset key occurs hundreds of
 #: times because the catalogue holds every map.
 MAP_LINE = " - LOC: "
+#: The same line in a lobby set to play without the timer: the map, then the
+#: game type, and nothing after it ("1799 - Trebbia - Deathmatch").
+MAP_LINE_PLAIN = " - Deathmatch"
 
 
 def map_from_status(text):
@@ -964,9 +967,14 @@ def map_from_status(text):
     server resolves to a preset key. A forward-pointer answer that replaces
     the thumbnail count's threshold.
     """
-    if not text or MAP_LINE not in text:
+    if not text:
         return ""
-    name = text.split(MAP_LINE)[0].strip()
+    if MAP_LINE in text:
+        name = text.split(MAP_LINE)[0].strip()
+    elif text.rstrip().endswith(MAP_LINE_PLAIN):
+        name = text.rstrip()[:-len(MAP_LINE_PLAIN)].strip()
+    else:
+        return ""
     # Guard against a stray string that happens to carry the separator: the
     # lobby's own is short and has no control characters in it.
     if not name or len(name) > 60 or not name.isprintable():
@@ -977,6 +985,9 @@ def map_from_status(text):
 #: The map line as bytes, for finding it in memory rather than waiting for it
 #: to pass through the status slot.
 MAP_LINE_NEEDLE = MAP_LINE.encode("utf-16-le")
+#: The plain line ends there, so its terminator is part of the needle.
+MAP_LINE_NEEDLES = (MAP_LINE_NEEDLE,
+                    (MAP_LINE_PLAIN + "\0").encode("utf-16-le"))
 
 #: Regions that held the map line last time, so the next read is a few
 #: milliseconds instead of a sweep. Memory only.
@@ -1013,20 +1024,21 @@ def read_map_line(pid=None, hints=None):
             d = _read(h, base, size)
             if not d:
                 continue
-            i = d.find(MAP_LINE_NEEDLE)
-            while i >= 0:
-                if i % 2 == 0:
-                    name = _line_before(d, i)
-                    if name:
-                        # The LONGEST candidate, not the first. Some copies
-                        # sit against the front of their allocation, where
-                        # the walk backwards runs out of buffer and returns
-                        # "99 - Trebbia" for "1799 - Trebbia", which resolves
-                        # to no map at all.
-                        if len(name) > len(found):
-                            found = name
-                        bases.add(base)
-                i = d.find(MAP_LINE_NEEDLE, i + 1)
+            for needle in MAP_LINE_NEEDLES:
+                i = d.find(needle)
+                while i >= 0:
+                    if i % 2 == 0:
+                        name = _line_before(d, i)
+                        if name:
+                            # The LONGEST candidate, not the first. Some copies
+                            # sit against the front of their allocation, where
+                            # the walk backwards runs out of buffer and returns
+                            # "99 - Trebbia" for "1799 - Trebbia", which resolves
+                            # to no map at all.
+                            if len(name) > len(found):
+                                found = name
+                            bases.add(base)
+                    i = d.find(needle, i + 1)
     finally:
         k32.CloseHandle(h)
     return found, bases
@@ -1468,7 +1480,7 @@ _map_bases = set()
 
 
 def scan_records(pid=None):
-    """The lobby browser's records, from a walk of the whole process.
+    """The lobby browser's records and the Info line, from a walk of the whole process.
 
     Opens the process read-only. Returns the raw windows record_windows cuts,
     and remembers the regions that held records so read_map can re-read them
@@ -1490,7 +1502,7 @@ def scan_records(pid=None):
     h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not h:
         return []
-    records, bases = [], set()
+    records, bases, info = [], set(), []
     slice_start = time.monotonic()
     try:
         for base, size in _regions(h):
@@ -1498,12 +1510,21 @@ def scan_records(pid=None):
                 time.sleep(SCAN_PAUSE)
                 slice_start = time.monotonic()
             d = _read(h, base, size)
-            if d and b"7656119" in d and _note_records(records, d):
+            if not d:
+                continue
+            if b"7656119" in d and _note_records(records, d):
+                bases.add((base, size))
+            # The lobby's Info line too: a lobby reached by invitation has no
+            # browser record of its host, and then this is the map's only
+            # trace once the lobby stops drawing its map label (11 November
+            # 2026, Aspern-Essling hosted by a friend).
+            if INFO_SEP in d and _collect_info(info, d):
                 bases.add((base, size))
     finally:
         k32.CloseHandle(h)
-    global _map_bases
+    global _map_bases, _info_names
     _map_bases = set(_map_bases) | bases
+    _info_names = info
     return records
 
 

@@ -186,6 +186,10 @@ try:
 except Exception:                      # pragma: no cover
     def detect_player(explicit=None):
         return None, None
+try:
+    import peers
+except Exception:                      # pragma: no cover
+    peers = None
 
 # Colours sampled from the game's own lobby panels, so this reads as part of
 # the game rather than a foreign app on top of it.
@@ -205,7 +209,8 @@ COAT = "#9C3A2E"     # the Redcoatz badge beside a name: a madder-red coat
 COAT_LINE = "#C08880"  # the unfixed coat's outline
 COAT_BUTTON = "#A89070"  # the fixed coat's edge and buttons
 # The host lamp beside the host's name: how their lobbies tend to end.
-# Prototype: the server does not send it yet; the demo roster carries it.
+# Not in use: the server sends the host's numbers and no mark, so the panel
+# shows the word "host" and the numbers on hover. Kept for --demo.
 HOST_GOOD = "#5DBA5A"    # green: battles reach the end
 HOST_BAD = "#D2402E"     # red: lobbies that fall apart, host has left battles
 HOST_WORST = "#141010"   # black: a pattern of leaving their own battles
@@ -339,6 +344,17 @@ LOBBY_RECHECK_SECONDS = 0.15
 # client dying mid-battle closely enough and keeps eight players under a
 # hundred requests an hour.
 HEARTBEAT_SECONDS = 300
+#: Developer machines only: how often _peer_scan reads the game during a
+#: battle.
+PEER_SCAN_SECONDS = 60
+#: Who has left the battle (_peer_check): a quick look this often, a wider
+#: one and a whole one at the longer intervals.
+PEER_LOOK_SECONDS = 5
+PEER_NEAR_SECONDS = 15
+PEER_FULL_SECONDS = 30
+#: How long the "X has left the game" notice stays up when the panel is
+#: collapsed.
+LEFT_NOTICE_SECONDS = 3
 
 # How often, while waiting out POLL_SECONDS, to re-read just the regions that
 # held lobby records last time. A few milliseconds against seconds for a full
@@ -1040,6 +1056,102 @@ class Poller(threading.Thread):
         """Ask the thread to finish."""
         self._stop.set()
 
+    def _peer_scan(self, pid):
+        """Developer machines only: log who the game still counts as a player.
+
+        Research, 15 November 2026: which of the game's own tables shows a
+        player leaving mid-battle. Runs test/peerwatch.py's scan once a
+        minute on a thread of its own, writing test/peerwatch.log. The script
+        is not part of a built client (client/test is never packaged and the
+        import is by path), so this does nothing outside a source checkout.
+        """
+        if not DEV_TRACE or not pid:
+            return
+        names = getattr(self, "_peer_names", None)
+        now = time.monotonic()
+        if not names or now - getattr(self, "_peer_at", 0.0) < PEER_SCAN_SECONDS:
+            return
+        busy = getattr(self, "_peer_thread", None)
+        if busy is not None and busy.is_alive():
+            return
+        self._peer_at = now
+        try:
+            if getattr(self, "_peer_mod", None) is None:
+                import importlib.util
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "test", "peerwatch.py")
+                spec = importlib.util.spec_from_file_location("peerwatch", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                self._peer_mod = mod
+            watch = getattr(self, "_peer_watch", None)
+            if watch is None or watch.names != names:
+                watch = self._peer_watch = self._peer_mod.Watch(names)
+
+            def run():
+                try:
+                    watch.tick(pid, "battle (from the client)")
+                except Exception as e:
+                    print("peer scan failed: %r" % (e,))
+            self._peer_thread = threading.Thread(target=run, daemon=True)
+            self._peer_thread.start()
+        except Exception as e:
+            print("peer scan unavailable: %r" % (e,))
+            self._peer_names = None
+
+    def _peer_check(self, pid):
+        """Tell the panel when a player has left the battle (peers.Battle).
+
+        A quick look every few seconds, a wider one now and then, each on a
+        thread of its own so the battle loop never waits for it. A player is
+        announced only when two looks in a row agree, and never once the
+        battle is over: people leaving the results screen are not leavers.
+        """
+        names = getattr(self, "_peer_names", None)
+        if (not pid or not names or len(names) < 2 or peers is None
+                or self._end_reported or self._save_screen_reported):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_peer_look_at", 0.0) < PEER_LOOK_SECONDS:
+            return
+        busy = getattr(self, "_peer_look", None)
+        if busy is not None and busy.is_alive():
+            return
+        self._peer_look_at = now
+        battle = getattr(self, "_peer_battle", None)
+        if battle is None:
+            me = (detect_player() or (None, None))[1]
+            battle = self._peer_battle = peers.Battle(list(names), me)
+            # {steam id: when it was seen}, for the reports. See _report_end.
+            self._peer_suspect, self._peer_left = set(), {}
+            self._peer_near_at = self._peer_full_at = 0.0
+        if now - self._peer_full_at >= PEER_FULL_SECONDS:
+            depth, self._peer_full_at, self._peer_near_at = "full", now, now
+        elif now - self._peer_near_at >= PEER_NEAR_SECONDS:
+            depth, self._peer_near_at = "near", now
+        else:
+            depth = "spots"
+
+        def run():
+            try:
+                gone = battle.gone(pid, depth)
+            except Exception as e:
+                self.out.put(("note", "peer check failed: %r" % (e,)))
+                return
+            if gone is None or battle is not getattr(self, "_peer_battle", None):
+                return
+            new = sorted(gone & self._peer_suspect - set(self._peer_left))
+            for sid in new:
+                self._peer_left[sid] = time.monotonic()
+                self.out.put(("note", "left the battle: %s (%d)" % (names[sid], sid)))
+                self.out.put(("left", (sid, names[sid])))
+            self._peer_suspect = gone
+            # A battle status like the others: who has gone, to the server.
+            if new and self._battle and not self._end_reported:
+                self._report_end("player_left")
+        self._peer_look = threading.Thread(target=run, daemon=True)
+        self._peer_look.start()
+
     def _watch_for_results(self):
         """Sit out a battle with cheap memory reads, until it ends or the game goes.
 
@@ -1089,6 +1201,8 @@ class Poller(threading.Thread):
                                  now - self._last_beat >= HEARTBEAT_SECONDS):
                 self._last_beat = now
                 self._report_end("in_progress")
+            self._peer_scan(pid)
+            self._peer_check(pid)
             try:
                 started = time.monotonic()
                 # Whether this pass thinks the battle is finishing. Gates the
@@ -1618,6 +1732,12 @@ class Poller(threading.Thread):
             named = getattr(self, "_status_map", "")
             self._lobby_sids = ({sid for _, sid in humans if sid}
                                 if state == STATE_LOBBY else set())
+            # The last lobby's players, kept through the battle to say who
+            # has left it (see _peer_check). A new lobby is a new battle.
+            if state == STATE_LOBBY and humans:
+                self._peer_names = {int(sid): n for n, sid in humans if sid}
+                self._peer_battle = None
+                self._peer_left = {}
 
             # The reading, kept for the watcher between passes, which re-reads
             # only the map signals. Sent when it differs from what the server
@@ -1868,6 +1988,15 @@ class Poller(threading.Thread):
         post = self._postbattle_since(getattr(self, "_battle_began", 0))
         if post is not None:
             body["postbattle"] = post
+        # Who has left the battle so far and how long ago, oldest first. On
+        # the report that says so and on every one after it.
+        gone = dict(getattr(self, "_peer_left", None) or {})
+        if gone:
+            now = time.monotonic()
+            names = getattr(self, "_peer_names", None) or {}
+            body["left"] = [{"steam_id": str(sid), "name": names.get(sid, ""),
+                             "ago": round(now - at, 1)}
+                            for sid, at in sorted(gone.items(), key=lambda kv: kv[1])]
         try:
             req = urllib.request.Request(
                 f"{self.server}/v1/gameStart",
@@ -1983,24 +2112,29 @@ class Poller(threading.Thread):
                 changed = named != reading["named"]
                 reading["named"] = named
                 if not self._last_map:
-                    # No map yet: the cheap regions first, and when those
-                    # are not known, which is the case when the client
-                    # started with the lobby already up, walk for them, then
-                    # leave it a while.
+                    # No map yet: the cheap regions first, then, paced, a
+                    # walk of the whole process. The walk is not only for a
+                    # client started with the lobby already up: the regions
+                    # remembered can be full of other hosts' records and still
+                    # miss this lobby's, as when the lobby was reached by an
+                    # invitation and its Info line is the only trace of the
+                    # map (11 November 2026).
                     _guess, records = read_map()
-                    if (not records
-                            and time.monotonic() >= getattr(self, "_host_scan_at", 0.0)):
+                    if time.monotonic() >= getattr(self, "_host_scan_at", 0.0):
                         gap = min(max(getattr(self, "_host_scan_gap", 0.0) * 2,
                                       HOST_SCAN_SECONDS), HOST_SCAN_MAX_SECONDS)
                         self._host_scan_gap = gap
                         self._host_scan_at = time.monotonic() + gap
-                        records = scan_records()
+                        records = scan_records() or records
                     if records:
                         fresh = {bytes(w) for w in records}
                         if fresh != {bytes(w) for w in reading["records"]}:
                             reading["records"] = list(fresh)
                             changed = True
-                        reading["info"] = info_names_seen()
+                    info = info_names_seen()
+                    if info and info != reading["info"]:
+                        reading["info"] = info
+                        changed = True
                 if changed:
                     self._post_reading()
             except Exception:
@@ -2060,6 +2194,14 @@ class Overlay:
         self.tab_w = int(BASE_TAB_W * self.s)
         self.tab_h = int(BASE_TAB_H * self.s)
         self.collapsed = False
+        # Players who have left the battle being fought: {steam id: name}.
+        # Taken off the drawn roster until the next lobby. And the notices
+        # now showing over the collapsed badge: [(name, shown until)].
+        self.left = {}
+        self._notices = []
+        # The last lobby the server described: (players, seats, ai). Shown
+        # for the length of the battle that follows it.
+        self._battle_roster = None
         self.watcher = None
         self._stopping = False
         self.auto_hidden = False
@@ -2341,6 +2483,7 @@ class Overlay:
         if want == self.collapsed:
             return
         self.collapsed = want
+        self._notices = []
         self._watch_replays(want)
         if want:
             self.canvas.config(width=self.tab_w, height=self.tab_h)
@@ -2384,6 +2527,15 @@ class Overlay:
             return
         was, self.game_state = self.game_state, state
 
+        # The lobby empties while the battle loads, and the panel has by then
+        # been handed the top of the ladder in its place. Put back the lobby
+        # that started this battle: those are the players in it.
+        if state == STATE_BATTLE and self._battle_roster:
+            self.players, self.seats, self.ai = (
+                list(self._battle_roster[0]), dict(self._battle_roster[1]),
+                list(self._battle_roster[2]))
+            self.scope = "lobby"
+
         # Into a battle: say so, then get out of the way. A panel that
         # vanishes without a word reads as a crash.
         if state == STATE_BATTLE and was == STATE_LOBBY:
@@ -2391,6 +2543,7 @@ class Overlay:
             # this battle's replay, even from a player quick to save.
             self._replays_before = self._replay_names()
             self._saved_seen = False
+            self.left = {}
             # The map goes with the lobby it describes.
             self._close_map()
             if not self.collapsed:
@@ -2402,10 +2555,90 @@ class Overlay:
         # Back to the lobby: undo only a collapse the panel made itself.
         if state == STATE_LOBBY:
             self._asked_to_save = False
+            self.left = {}
+            self._clear_notices()
             if self.collapsed and self.auto_hidden:
                 self._hiding_at = None
                 self.auto_hidden = False
                 self.toggle(False)
+
+    # ---- players leaving a battle -----------------------------------------
+
+    def _on_left(self, sid, name):
+        """A player has left the battle: off the list, and say so.
+
+        Collapsed, the badge grows into a one-line notice for a few seconds
+        and shrinks back. Open, the name simply goes from the roster. Not
+        after the battle is over: leaving the results screen is not leaving.
+        """
+        if self._asked_to_save or sid in self.left:
+            return
+        self.left[sid] = name
+        # In the log, so "did it show" has an answer after the battle.
+        print("left the battle: %s; %s" % (name, "notice shown" if self.collapsed
+                                           else "panel open, taken off the list"))
+        if self.collapsed:
+            self._notices.append((name, time.time() + LEFT_NOTICE_SECONDS))
+            self._size_notice()
+            self.root.after(int(LEFT_NOTICE_SECONDS * 1000) + 50,
+                            self._expire_notices)
+        self.draw()
+
+    def _notice_size(self):
+        n = max(1, len(self._notices))
+        return self.w, int((14 + 20 * n) * self.s)
+
+    def _size_notice(self):
+        """Fit the collapsed window to the notices showing, or back to the badge."""
+        if not self.collapsed:
+            return
+        w, h = self._notice_size() if self._notices else (self.tab_w, self.tab_h)
+        self.canvas.config(width=w, height=h)
+        self.root.geometry(f"{w}x{h}")
+        try:
+            self.root.update_idletasks()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+    def _expire_notices(self):
+        now = time.time()
+        keep = [n for n in self._notices if n[1] > now]
+        if len(keep) != len(self._notices):
+            self._notices = keep
+            self._size_notice()
+            self.draw()
+
+    def _clear_notices(self):
+        if self._notices:
+            self._notices = []
+            self._size_notice()
+
+    def _has_left(self, p):
+        """Has this player of the roster left the battle being fought?"""
+        if not self.left:
+            return False
+        return (str(p.get("name")) in self.left.values()
+                or str(p.get("steam_id") or "-") in {str(k) for k in self.left})
+
+    def _draw_notice(self):
+        """The collapsed badge, grown to say who has left."""
+        c = self.canvas
+        c.delete("all")
+        s = self.s
+        w, h = self._notice_size()
+        c.create_rectangle(0, 0, w, h, fill=EDGE, outline="")
+        c.create_rectangle(1, 1, w - 2, h - 2, fill=GOLD, outline="")
+        c.create_rectangle(int(3 * s), int(3 * s), w - int(3 * s) - 1,
+                           h - int(3 * s) - 1, fill=HEADER, outline="")
+        y = int(7 * s) + int(10 * s)
+        for name, _until in self._notices:
+            if len(name) > 22:
+                name = name[:21] + "…"
+            c.create_text(w // 2, y, text=f"{name} has left the game",
+                          fill=TITLE, font=self.f_row)
+            y += int(20 * s)
 
     def _replay_names(self):
         """List the .replay file names in the game's replay folder (uploader.REPLAY_DIR).
@@ -2937,12 +3170,24 @@ class Overlay:
                 if kind == "ok":
                     # A fresh answer from the server.
                     self.me = payload.get("me") or self.me
+                    self.status = "connected"
+                    self.last_ok = time.time()
+                    lobby = (payload.get("scope") == "lobby"
+                             and payload.get("players"))
+                    # In a battle the roster is the lobby that started it:
+                    # the lobby is gone from the game by then, and the
+                    # ladder's top ten is not who is on the field.
+                    if (self.game_state == STATE_BATTLE and not lobby
+                            and self._battle_roster):
+                        self.draw()
+                        continue
                     self._seat_players(payload.get("players", []),
                                        payload.get("seats") or {})
                     self.ai = payload.get("ai") or []
                     self.scope = payload.get("scope", "global")
-                    self.status = "connected"
-                    self.last_ok = time.time()
+                    if lobby:
+                        self._battle_roster = (list(self.players),
+                                               dict(self.seats), list(self.ai))
                 elif kind == "fault":
                     self.lobby_fault = payload
                 elif kind == "seats":
@@ -2960,6 +3205,9 @@ class Overlay:
                     self.map_key = payload
                 elif kind == "state":
                     self._on_state(payload)
+                elif kind == "left":
+                    self._on_left(*payload)
+                    continue
                 elif kind == "results":
                     # The quick check found the Save Replay button. It only
                     # runs during a battle, so no state guard is needed.
@@ -2984,8 +3232,12 @@ class Overlay:
     def _draw_panel(self):
         """Draw the frame, title bar, roster, map line and status line."""
         if self.collapsed:
-            self._draw_tab()
+            if self._notices:
+                self._draw_notice()
+            else:
+                self._draw_tab()
             return
+        players = self.players
         c = self.canvas
         c.delete("all")
         self._tip_hide()
@@ -3085,11 +3337,11 @@ class Overlay:
         # Where the two alliances part, if the seats were readable: one side,
         # a gap, the other side, as the lobby shows it.
         gap_at = None
-        if self.seats and self.players:
-            first = self.seats.get(str(self.players[0].get("name")),
+        if self.seats and players:
+            first = self.seats.get(str(players[0].get("name")),
                                    (0, 0))[0]
             gap_at = next(
-                (i for i, p in enumerate(self.players)
+                (i for i, p in enumerate(players)
                  if self.seats.get(str(p.get("name")), (first, 0))[0] != first),
                 None)
 
@@ -3109,11 +3361,11 @@ class Overlay:
                                fill=(ROW_A if k % 2 == 0 else ROW_B),
                                outline="")
 
-        if not self.players and not self.ai:
+        if not players and not self.ai:
             c.create_text(w // 2, y + int(30 * s),
                           text="waiting for the server..." if not self.demo else "no players yet",
                           fill=DIM, font=self.f_small)
-        for i, p in enumerate(self.players[:max_rows]):
+        for i, p in enumerate(players[:max_rows]):
             y = rows_y[i] if i < len(rows_y) else y + row_h
             rank = p.get("rank", i + 1)
             name = str(p.get("name", "?"))
@@ -3130,6 +3382,18 @@ class Overlay:
                 c.create_text(left, y, anchor="w", text=f"{seat[1] + 1}",
                               fill=DIM, font=self.f_row)
                 nx = left + int(14 * s)
+
+            # Gone from the battle: the row keeps its place, so the sides
+            # still read as they were, and says so in place of the record.
+            if self._has_left(p):
+                # The words first, where the eye lands, and the name after
+                # them: set in from the others by that much.
+                c.create_text(nx, y, anchor="w", text="left game",
+                              fill=LOSS, font=self.f_row)
+                c.create_text(nx + self.f_row.measure("left game") + int(8 * s),
+                              y, anchor="w", text=shown_name(name), fill=DIM,
+                              font=self.f_row)
+                continue
 
             # The red coat: this player runs Redcoatz, filled when every crash
             # fix is on, an outline when not (see redcoatzBadge on the
@@ -3152,17 +3416,26 @@ class Overlay:
             label = shown_name(name)
             c.create_text(nx, y, anchor="w", text=label,
                           fill=TEXT if label == name else DIM, font=self.f_row)
-            # The host, with the lamp for how their lobbies tend to end.
+            # The host: the word, and on hover what became of the battles
+            # they hosted. A lamp too if the server ever sends a mark.
             host = p.get("host")
-            if isinstance(host, dict) and host.get("mark"):
+            if isinstance(host, dict) and not self._has_left(p):
                 lx = nx + self.f_row.measure(label) + int(10 * s)
+                if host.get("mark"):
+                    def lamp(lx=lx, y=y, mark=host["mark"]):
+                        self._draw_host_lamp(c, lx, y, s, mark)
+                        c.create_text(lx + int(11 * s), y, anchor="w", text="host",
+                                      fill=DIM, font=self.f_small)
+                    self._tip_region(c, lx + int(16 * s), y, s, band, lamp,
+                                     host_text(host), half_w=22)
+                else:
+                    half = self.f_small.measure("host") // 2 + int(3 * s)
 
-                def lamp(lx=lx, y=y, mark=host["mark"]):
-                    self._draw_host_lamp(c, lx, y, s, mark)
-                    c.create_text(lx + int(11 * s), y, anchor="w", text="host",
-                                  fill=DIM, font=self.f_small)
-                self._tip_region(c, lx + int(16 * s), y, s, band, lamp,
-                                 host_text(host), half_w=22)
+                    def word(lx=lx, y=y):
+                        c.create_text(lx, y, anchor="w", text="host",
+                                      fill=DIM, font=self.f_small)
+                    self._tip_region(c, lx + half - int(3 * s), y, s, band, word,
+                                     host_text(host), half_w=half / s)
             c.create_text(right - int(112 * s), y, anchor="e",
                           text=str(p.get("rating", "-")), fill=GOLD, font=self.f_row)
             rec = f"{wins}-{losses}-{draws}"
@@ -3194,12 +3467,12 @@ class Overlay:
                                p.get("recent"))
 
         # Carry on below the last row drawn, whether or not a gap was inserted.
-        y = (rows_y[min(len(self.players[:max_rows]), len(rows_y) - 1)]
+        y = (rows_y[min(len(players[:max_rows]), len(rows_y) - 1)]
              if rows_y else y)
         y += row_h
 
         # AI seats last, dimmed and unranked.
-        for name in self.ai[:max(0, max_rows - len(self.players))]:
+        for name in self.ai[:max(0, max_rows - len(players))]:
             c.create_text(left, y, anchor="w", text=name,
                           fill=DIM, font=self.f_row)
             c.create_text(right, y, anchor="e", text="AI", fill=DIM,
@@ -3281,6 +3554,10 @@ class Overlay:
             # Which list this is: the top of the ladder and the lobby look
             # identical otherwise.
             where = "IN LOBBY" if self.scope == "lobby" else "TOP RANKED"
+            if self.scope == "lobby" and self.game_state == STATE_BATTLE:
+                where = "IN BATTLE"
+                if self.left:
+                    where += f", {len(self.left)} LEFT"
             msg = f"{where} - {when}"
             col = DIM
         elif self.demo:
@@ -3732,25 +4009,32 @@ def coat_text(badge):
 
 def host_text(host):
     """The host's whole record, as the lamp summarises it."""
+    if "hosted" not in host:
+        return "Hosting this lobby"
     hosted = host.get("hosted") or 0
+    if not hosted:
+        return "Hosting this lobby\nNo hosted games on record yet"
     fin = host.get("finished") or 0
-    pct = f" ({round(100 * fin / hosted)}%)" if hosted else ""
+    # A share of three games is not a habit: counts only until there are five.
+    pct = f" ({round(100 * fin / hosted)}%)" if hosted >= 5 else ""
     head = {"good": "Reliable host: battles reach the end.",
             "bad": "Unreliable host: lobbies often fall apart.",
             "worst": "Has left their own battles."}.get(host.get("mark"), "Host record")
     lines = [head,
-             f"{hosted} games hosted",
-             f"{fin} reached the save screen{pct}",
+             f"{hosted} game{'s' if hosted != 1 else ''} hosted",
+             f"{fin} reached the end{pct}",
              f"{host.get('replays') or 0} replays uploaded",
-             f"{host.get('host_left') or 0} left by the host",
+             f"{host.get('host_left') or 0} ended by the host leaving",
+             f"{host.get('early') or 0} over in the opening minutes",
              f"{host.get('broken') or 0} broken by a crash or drop"]
     return "\n".join(lines)
 
 
 # The --demo lobby: a 4v4 with one of everything the panel can show (coat,
 # skull, host lamp). DEMO_SEATS is {name: (alliance, position)}.
-DEMO_HOST_MARK = "good"
+DEMO_HOST_MARK = ""      # "" is what ships: the word and the numbers, no lamp
 DEMO_HOST = {
+    "": {"hosted": 35, "finished": 30, "replays": 25, "host_left": 1, "early": 2, "broken": 2},
     "good": {"hosted": 41, "finished": 38, "replays": 33, "host_left": 0, "broken": 3},
     "bad": {"hosted": 26, "finished": 17, "replays": 14, "host_left": 1, "broken": 8},
     "worst": {"hosted": 16, "finished": 10, "replays": 7, "host_left": 4, "broken": 2},

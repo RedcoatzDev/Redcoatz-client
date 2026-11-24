@@ -40,8 +40,9 @@ import steamauth  # noqa: E402
 #: withdrew the on-disk exe edit, disclosed the in-memory artillery fix and
 #: made the repairs required; 6 added the one-click self-update; 7 disclosed
 #: that the lobby's seat list and browser entries are sent as read from the
-#: game's memory, for the server to interpret (0.8.4).
-TERMS_TEXT = "7"
+#: game's memory, for the server to interpret (0.8.4); 8 moved updates to
+#: GitHub releases only, with a question before each one.
+TERMS_TEXT = "8"
 
 #: What is stored and sent. Includes the client version, so a new build asks
 #: again; see the module docstring.
@@ -85,10 +86,14 @@ WHAT THIS PROGRAM DOES
     folder beside it, and Steam's "Verify integrity of game files"
     undoes any of it. If an earlier version changed Napoleon.exe,
     this one puts the original back.
-  * When a newer version exists and you click to update, it
-    downloads the new Redcoatz from redcoatz.com, checks that the
-    file is exactly the published one, replaces itself with it in
-    the same folder, and restarts. It never updates on its own.
+  * When a newer version exists and you click to update, it asks
+    you first, naming the version and where it comes from. Updates
+    come only from the public GitHub repository
+    github.com/RedcoatzDev/Redcoatz-client, from a release whose
+    program GitHub itself built from the source published there.
+    The client checks the download against GitHub's checksum,
+    replaces itself with it in the same folder, and restarts. It
+    never updates on its own, and saying no changes nothing.
   * If a battle desynchronises, the game itself writes a log naming
     who lost sync. The client sends that log, so the ladder has a
     record of battles that collapsed. The game writes this file
@@ -106,7 +111,8 @@ WHAT IS SENT TO THE SERVER
     is still going, and how it ended -- whether the save-replay
     screen appeared, whether the host left, whether you were
     dropped, and whether the game closed on its own. These name
-    the other players who were in that battle.
+    the other players who were in that battle, and say which of
+    them left before it was over.
   * The version of this client, sent with every request.
   * Each time the client starts: which of the crash repairs
     described above are in place on your install.
