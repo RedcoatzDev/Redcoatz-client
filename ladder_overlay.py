@@ -190,6 +190,10 @@ try:
     import peers
 except Exception:                      # pragma: no cover
     peers = None
+try:
+    import setup_screen
+except Exception:                      # pragma: no cover
+    setup_screen = None
 
 # Colours sampled from the game's own lobby panels, so this reads as part of
 # the game rather than a foreign app on top of it.
@@ -3611,7 +3615,52 @@ class Overlay:
                 items.append(("Disconnect Steam account", self._disconnect, TEXT))
         else:
             items.append(("Sign in through Steam", self._connect, TEXT))
+        if setup_screen is not None:
+            items.append(("Install or repair NTW3", self.open_setup, TEXT))
         return items
+
+    def open_setup(self):
+        """Open the NTW3 installer window, or bring the open one forward.
+
+        The window only looks until the player clicks Install and says yes
+        to its question; see setup_screen.
+        """
+        if setup_screen is None:
+            return
+        self._menu_open = False
+        self.draw()
+        win = getattr(self, "_setup", None)
+        try:
+            if win is not None and win.win.winfo_exists():
+                win.win.deiconify()
+                win.win.lift()
+                return
+        except tk.TclError:
+            pass
+
+        def closed(ready):
+            self._setup = None
+            print(f"setup screen closed; everything installed: {ready}")
+            # Set by the launcher when this run could not start the game for
+            # want of NTW3: with everything now installed, carry on.
+            done = getattr(self, "setup_done", None)
+            if ready and done:
+                self.setup_done = None
+                done()
+        try:
+            print("opening the setup screen")
+            self._setup = setup_screen.SetupScreen(self.root, on_close=closed, log=print)
+            # In front once, and clear of the panel, which stays on top of
+            # everything; then an ordinary window again.
+            w = self._setup.win
+            w.geometry("+%d+%d" % (max(40, (w.winfo_screenwidth() - 680) // 2), 60))
+            w.attributes("-topmost", True)
+            w.lift()
+            w.focus_force()
+            w.after(400, lambda: w.winfo_exists() and w.attributes("-topmost", False))
+        except Exception as e:               # noqa: BLE001 - never takes the panel down
+            self._setup = None
+            print(f"setup screen failed to open: {e!r}")
 
     def _draw_menu(self, c, w, hdr, s):
         """The account menu, drawn on the canvas so clicks never take focus from the game.

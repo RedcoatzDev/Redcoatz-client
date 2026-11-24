@@ -312,6 +312,8 @@ def main():
         "--hidden-import", "roster",
         "--hidden-import", "lobby",
         "--hidden-import", "peers",
+        "--hidden-import", "setup_screen",
+        "--hidden-import", "ntw3setup",
         # The rest are imported lazily, inside functions, so PyInstaller's
         # static analysis never sees them; left out, the feature silently does
         # nothing in the frozen exe while working from source.

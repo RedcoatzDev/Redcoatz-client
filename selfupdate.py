@@ -232,6 +232,33 @@ def swap_and_restart(new):
         raise
 
 
+def restart_self(log=print):
+    """Start this program again with the same arguments and return True; the
+    caller then closes. The new copy waits for this one to exit before it
+    claims the single-copy lock. Used after the NTW3 installer has finished,
+    so every start-up check runs against the new files and the game starts."""
+    if getattr(sys, "frozen", False):
+        cmd = [os.path.abspath(sys.executable)]
+    else:
+        cmd = [sys.executable, os.path.abspath(sys.argv[0])]
+    try:
+        import singleton
+        singleton.release()
+    except Exception:                      # noqa: BLE001
+        pass
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("_MEI", "_PYI"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    try:
+        subprocess.Popen([*cmd, *_kept_args(), "--after-update", str(os.getpid())],
+                         cwd=os.path.dirname(cmd[-1]), env=env,
+                         creationflags=0x00000008 | 0x00000200, close_fds=True)
+    except OSError as e:
+        log(f"could not restart: {e!r}")
+        return False
+    return True
+
+
 def _kept_args():
     """This run's command line for the new copy, minus our own update flags."""
     out, skip = [], False
